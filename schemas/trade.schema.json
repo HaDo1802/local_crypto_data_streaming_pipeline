@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Trade",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["trade_id", "symbol", "price", "quantity", "side", "event_time"],
+  "properties": {
+    "trade_id":   { "type": "string" },
+    "symbol":     { "type": "string", "minLength": 3 },
+    "price":      { "type": "number", "exclusiveMinimum": 0 },
+    "quantity":   { "type": "number", "exclusiveMinimum": 0 },
+    "side":       { "type": "string", "enum": ["buy", "sell"] },
+    "event_time": { "type": "integer", "minimum": 0 }
+  }
+}

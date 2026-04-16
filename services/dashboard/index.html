@@ -1,0 +1,402 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Crypto Streaming Dashboard</title>
+<!-- TradingView Lightweight Charts for candlestick rendering -->
+<script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg:       #0d1117;
+    --surface:  #161b22;
+    --border:   #30363d;
+    --text:     #e6edf3;
+    --muted:    #8b949e;
+    --green:    #3fb950;
+    --red:      #f85149;
+    --blue:     #58a6ff;
+    --yellow:   #d29922;
+    --radius:   8px;
+    --header-h: 56px;
+  }
+
+  body { background: var(--bg); color: var(--text); font-family: 'Segoe UI', system-ui, sans-serif; font-size: 14px; }
+
+  /* ── Header ──────────────────────────────────────────────────────── */
+  header {
+    height: var(--header-h);
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    padding: 0 20px;
+    gap: 16px;
+    position: sticky; top: 0; z-index: 100;
+  }
+  header h1 { font-size: 16px; font-weight: 600; white-space: nowrap; }
+  header h1 span { color: var(--blue); }
+
+  #ws-indicator {
+    width: 10px; height: 10px; border-radius: 50%;
+    background: var(--red); flex-shrink: 0;
+    transition: background 0.3s;
+  }
+  #ws-indicator.connected { background: var(--green); }
+
+  /* ── Ticker bar ──────────────────────────────────────────────────── */
+  #ticker-bar {
+    display: flex; gap: 8px; overflow-x: auto;
+    padding: 8px 20px;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+  }
+  .ticker-chip {
+    display: flex; flex-direction: column;
+    padding: 6px 12px; border-radius: 6px;
+    background: var(--bg); border: 1px solid var(--border);
+    cursor: pointer; white-space: nowrap;
+    transition: border-color 0.2s;
+    min-width: 110px;
+  }
+  .ticker-chip:hover, .ticker-chip.active { border-color: var(--blue); }
+  .ticker-chip .sym   { font-size: 11px; font-weight: 600; color: var(--muted); }
+  .ticker-chip .price { font-size: 16px; font-weight: 700; }
+  .ticker-chip .chg   { font-size: 11px; }
+  .up   { color: var(--green); }
+  .down { color: var(--red); }
+
+  /* ── Main layout ─────────────────────────────────────────────────── */
+  main {
+    display: grid;
+    grid-template-columns: 1fr 320px;
+    grid-template-rows: auto auto;
+    gap: 12px;
+    padding: 12px 20px;
+    max-width: 1600px;
+    margin: 0 auto;
+  }
+
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 16px;
+  }
+  .card-title {
+    font-size: 12px; font-weight: 600;
+    text-transform: uppercase; letter-spacing: 0.05em;
+    color: var(--muted); margin-bottom: 12px;
+    display: flex; justify-content: space-between; align-items: center;
+  }
+
+  /* ── Candlestick chart ───────────────────────────────────────────── */
+  #chart-card { grid-row: 1; grid-column: 1; }
+  #chart-container { height: 380px; position: relative; }
+  #chart-container > div { border-radius: 6px; overflow: hidden; }
+
+  /* ── Symbol controls ─────────────────────────────────────────────── */
+  #symbol-select {
+    background: var(--bg); color: var(--text);
+    border: 1px solid var(--border); border-radius: 4px;
+    padding: 3px 8px; font-size: 13px; cursor: pointer;
+  }
+
+  /* ── Stats panel ─────────────────────────────────────────────────── */
+  #stats-card { grid-row: 1; grid-column: 2; }
+  .stat-row {
+    display: flex; justify-content: space-between;
+    padding: 7px 0; border-bottom: 1px solid var(--border);
+    font-size: 13px;
+  }
+  .stat-row:last-child { border-bottom: none; }
+  .stat-label { color: var(--muted); }
+  .stat-value { font-weight: 600; }
+
+  /* ── Trades table ────────────────────────────────────────────────── */
+  #trades-card { grid-row: 2; grid-column: 1; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { text-align: left; padding: 6px 8px; color: var(--muted); font-weight: 500; border-bottom: 1px solid var(--border); }
+  td { padding: 5px 8px; border-bottom: 1px solid var(--border); }
+  tr:last-child td { border-bottom: none; }
+  .side-buy  { color: var(--green); font-weight: 600; }
+  .side-sell { color: var(--red); font-weight: 600; }
+
+  /* ── Lake files panel ────────────────────────────────────────────── */
+  #lake-card { grid-row: 2; grid-column: 2; }
+  .lake-file {
+    padding: 6px 0; border-bottom: 1px solid var(--border);
+    font-size: 11px; font-family: monospace;
+    color: var(--muted); word-break: break-all;
+  }
+  .lake-file:last-child { border-bottom: none; }
+  .lake-file .file-key   { color: var(--text); }
+  .lake-file .file-meta  { color: var(--yellow); margin-top: 2px; }
+
+  /* ── Loading/empty states ────────────────────────────────────────── */
+  .empty { text-align: center; color: var(--muted); padding: 32px; font-size: 13px; }
+
+  @media (max-width: 900px) {
+    main { grid-template-columns: 1fr; }
+    #stats-card, #lake-card { grid-column: 1; }
+    #stats-card { grid-row: 2; }
+    #trades-card { grid-row: 3; }
+    #lake-card   { grid-row: 4; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div id="ws-indicator" title="WebSocket status"></div>
+  <h1>⚡ Crypto <span>Streaming</span> Dashboard</h1>
+  <small style="color:var(--muted);margin-left:auto">Kafka · Flink · MinIO · FastAPI</small>
+</header>
+
+<div id="ticker-bar">
+  <div class="ticker-chip" style="cursor:default">
+    <span class="sym">LIVE PRICES</span>
+    <span class="price" style="font-size:12px;color:var(--muted)">connecting…</span>
+  </div>
+</div>
+
+<main>
+  <!-- Chart -->
+  <div class="card" id="chart-card">
+    <div class="card-title">
+      <span>OHLCV Candles (1-min)</span>
+      <select id="symbol-select"><option value="">— select symbol —</option></select>
+    </div>
+    <div id="chart-container">
+      <div class="empty">Select a symbol to load chart</div>
+    </div>
+  </div>
+
+  <!-- Stats -->
+  <div class="card" id="stats-card">
+    <div class="card-title">Pipeline Stats</div>
+    <div id="stats-content"><div class="empty">Loading…</div></div>
+  </div>
+
+  <!-- Trades -->
+  <div class="card" id="trades-card">
+    <div class="card-title">
+      <span>Latest Trades</span>
+      <span id="trades-symbol" style="color:var(--blue)"></span>
+    </div>
+    <div id="trades-content"><div class="empty">Select a symbol above</div></div>
+  </div>
+
+  <!-- Lake files -->
+  <div class="card" id="lake-card">
+    <div class="card-title">Lakehouse Files (MinIO)</div>
+    <div id="lake-content"><div class="empty">Loading…</div></div>
+  </div>
+</main>
+
+<script>
+const API = '';   // same origin
+let chart = null;
+let candleSeries = null;
+let currentSymbol = null;
+let ws = null;
+const priceCache = {};   // symbol → {price, prev}
+
+// ── Utility ──────────────────────────────────────────────────────────────────
+const fmt = (n, d=2) => Number(n).toLocaleString('en-US', {minimumFractionDigits:d, maximumFractionDigits:d});
+const fmtTime = ts => new Date(ts).toLocaleTimeString();
+
+// ── Ticker bar ───────────────────────────────────────────────────────────────
+function updateTicker(prices) {
+  const bar = document.getElementById('ticker-bar');
+  prices.forEach(({symbol, price}) => {
+    const prev = priceCache[symbol]?.price ?? price;
+    priceCache[symbol] = {price, prev};
+
+    let chip = document.getElementById('chip-' + symbol);
+    if (!chip) {
+      chip = document.createElement('div');
+      chip.className = 'ticker-chip';
+      chip.id = 'chip-' + symbol;
+      chip.onclick = () => selectSymbol(symbol);
+      bar.appendChild(chip);
+    }
+    const chg = price - prev;
+    const pct = prev ? (chg / prev * 100) : 0;
+    const dir = chg >= 0 ? 'up' : 'down';
+    const dp  = price < 10 ? 4 : 2;
+    chip.innerHTML = `
+      <span class="sym">${symbol}</span>
+      <span class="price ${dir}">${fmt(price, dp)}</span>
+      <span class="chg ${dir}">${chg >= 0 ? '+' : ''}${fmt(pct, 2)}%</span>`;
+    if (currentSymbol === symbol) chip.classList.add('active');
+  });
+}
+
+// ── WebSocket live prices ─────────────────────────────────────────────────────
+function connectWS() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}/ws/prices`);
+
+  ws.onopen = () => {
+    document.getElementById('ws-indicator').classList.add('connected');
+  };
+  ws.onmessage = evt => {
+    const msg = JSON.parse(evt.data);
+    if (msg.type === 'price_update') updateTicker(msg.prices);
+  };
+  ws.onclose = () => {
+    document.getElementById('ws-indicator').classList.remove('connected');
+    setTimeout(connectWS, 3000);   // auto-reconnect
+  };
+}
+
+// ── Symbol selector ───────────────────────────────────────────────────────────
+async function loadSymbols() {
+  const res = await fetch(`${API}/api/symbols`);
+  if (!res.ok) return;
+  const symbols = await res.json();
+  const sel = document.getElementById('symbol-select');
+  symbols.forEach(s => {
+    const opt = document.createElement('option');
+    opt.value = s; opt.textContent = s;
+    sel.appendChild(opt);
+  });
+  if (symbols.length > 0) selectSymbol(symbols[0]);
+}
+
+document.getElementById('symbol-select').addEventListener('change', e => {
+  if (e.target.value) selectSymbol(e.target.value);
+});
+
+async function selectSymbol(symbol) {
+  currentSymbol = symbol;
+  document.getElementById('symbol-select').value = symbol;
+  document.getElementById('trades-symbol').textContent = symbol;
+
+  // Highlight active chip
+  document.querySelectorAll('.ticker-chip').forEach(c => c.classList.remove('active'));
+  const chip = document.getElementById('chip-' + symbol);
+  if (chip) chip.classList.add('active');
+
+  await Promise.all([loadChart(symbol), loadTrades(symbol)]);
+}
+
+// ── OHLCV Chart ───────────────────────────────────────────────────────────────
+async function loadChart(symbol) {
+  const res = await fetch(`${API}/api/ohlcv/${symbol}?limit=120`);
+  if (!res.ok) {
+    document.querySelector('#chart-container').innerHTML =
+      `<div class="empty">No OHLCV data yet for ${symbol}.<br>Waiting for first Flink window to close…</div>`;
+    return;
+  }
+  const candles = await res.json();
+
+  const container = document.getElementById('chart-container');
+  container.innerHTML = '';   // clear
+
+  chart = LightweightCharts.createChart(container, {
+    width:  container.clientWidth,
+    height: 380,
+    layout: { background: { color: '#161b22' }, textColor: '#8b949e' },
+    grid:   { vertLines: { color: '#21262d' }, horzLines: { color: '#21262d' } },
+    crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+    rightPriceScale: { borderColor: '#30363d' },
+    timeScale: { borderColor: '#30363d', timeVisible: true },
+  });
+
+  candleSeries = chart.addCandlestickSeries({
+    upColor: '#3fb950', downColor: '#f85149',
+    borderUpColor: '#3fb950', borderDownColor: '#f85149',
+    wickUpColor: '#3fb950', wickDownColor: '#f85149',
+  });
+
+  const data = candles.map(c => ({
+    time:  Math.floor(new Date(c.window_start).getTime() / 1000),
+    open:  c.open_price,
+    high:  c.high_price,
+    low:   c.low_price,
+    close: c.close_price,
+  }));
+  candleSeries.setData(data);
+  chart.timeScale().fitContent();
+
+  // Resize observer
+  new ResizeObserver(() => {
+    if (chart) chart.applyOptions({ width: container.clientWidth });
+  }).observe(container);
+}
+
+// ── Latest trades ─────────────────────────────────────────────────────────────
+async function loadTrades(symbol) {
+  const res = await fetch(`${API}/api/trades/${symbol}/latest?limit=30`);
+  const el = document.getElementById('trades-content');
+  if (!res.ok) {
+    el.innerHTML = `<div class="empty">No raw trades stored yet for ${symbol}.<br>Trades are written by the lake writer.</div>`;
+    return;
+  }
+  const trades = await res.json();
+  el.innerHTML = `
+    <table>
+      <thead><tr>
+        <th>Time</th><th>Price</th><th>Qty</th><th>Side</th>
+      </tr></thead>
+      <tbody>
+        ${trades.map(t => `<tr>
+          <td>${fmtTime(t.event_time)}</td>
+          <td>${fmt(t.price, t.price < 10 ? 4 : 2)}</td>
+          <td>${fmt(t.quantity, 4)}</td>
+          <td class="side-${t.side}">${t.side.toUpperCase()}</td>
+        </tr>`).join('')}
+      </tbody>
+    </table>`;
+}
+
+// ── Pipeline stats ────────────────────────────────────────────────────────────
+async function loadStats() {
+  const res = await fetch(`${API}/api/stats`);
+  const el = document.getElementById('stats-content');
+  if (!res.ok) { el.innerHTML = '<div class="empty">Stats unavailable</div>'; return; }
+  const s = await res.json();
+  el.innerHTML = `
+    <div class="stat-row"><span class="stat-label">Total candles</span><span class="stat-value">${(s.total_candles||0).toLocaleString()}</span></div>
+    <div class="stat-row"><span class="stat-label">Stored trades</span><span class="stat-value">${(s.total_trades_stored||0).toLocaleString()}</span></div>
+    <div class="stat-row"><span class="stat-label">Active symbols</span><span class="stat-value">${s.active_symbols||0}</span></div>
+    <div class="stat-row"><span class="stat-label">Latest candle</span><span class="stat-value" style="font-size:11px">${s.latest_candle_at ? new Date(s.latest_candle_at).toLocaleTimeString() : '—'}</span></div>`;
+}
+
+// ── Lake files ────────────────────────────────────────────────────────────────
+async function loadLakeFiles() {
+  const res = await fetch(`${API}/api/lake/files?max_keys=20`);
+  const el = document.getElementById('lake-content');
+  if (!res.ok) { el.innerHTML = '<div class="empty">MinIO unavailable</div>'; return; }
+  const files = await res.json();
+  if (!files.length) { el.innerHTML = '<div class="empty">No Parquet files yet.<br>Lake writer flushes every 60s.</div>'; return; }
+  el.innerHTML = files.map(f => `
+    <div class="lake-file">
+      <div class="file-key">${f.key}</div>
+      <div class="file-meta">${f.size_kb} KB · ${new Date(f.last_modified).toLocaleString()}</div>
+    </div>`).join('');
+}
+
+// ── Bootstrap ─────────────────────────────────────────────────────────────────
+(async () => {
+  connectWS();
+  await loadSymbols();
+  await Promise.all([loadStats(), loadLakeFiles()]);
+
+  // Refresh stats, trades, and lake files every 10 seconds
+  setInterval(async () => {
+    await loadStats();
+    await loadLakeFiles();
+    if (currentSymbol) {
+      await loadTrades(currentSymbol);
+      await loadChart(currentSymbol);  // re-render chart with latest candles
+    }
+  }, 10_000);
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "OrderBook",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["symbol", "bid_price", "bid_size", "ask_price", "ask_size", "event_time"],
+  "properties": {
+    "symbol":     { "type": "string", "minLength": 3 },
+    "bid_price":  { "type": "number", "exclusiveMinimum": 0 },
+    "bid_size":   { "type": "number", "exclusiveMinimum": 0 },
+    "ask_price":  { "type": "number", "exclusiveMinimum": 0 },
+    "ask_size":   { "type": "number", "exclusiveMinimum": 0 },
+    "event_time": { "type": "integer", "minimum": 0 }
+  }
+}
