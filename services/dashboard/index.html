@@ -151,7 +151,7 @@
 
 <header>
   <div id="ws-indicator" title="WebSocket status"></div>
-  <h1>⚡ Crypto <span>Streaming</span> Dashboard</h1>
+  <h1>Crypto <span>Streaming</span> Dashboard</h1>
   <small style="color:var(--muted);margin-left:auto">Kafka · Flink · MinIO · FastAPI</small>
 </header>
 
@@ -166,7 +166,7 @@
   <!-- Chart -->
   <div class="card" id="chart-card">
     <div class="card-title">
-      <span>OHLCV Candles (1-min)</span>
+      <span>OHLCV (10s windows)</span>
       <select id="symbol-select"><option value="">— select symbol —</option></select>
     </div>
     <div id="chart-container">
@@ -334,7 +334,7 @@ async function loadTrades(symbol) {
   const res = await fetch(`${API}/api/trades/${symbol}/latest?limit=30`);
   const el = document.getElementById('trades-content');
   if (!res.ok) {
-    el.innerHTML = `<div class="empty">No raw trades stored yet for ${symbol}.<br>Trades are written by the lake writer.</div>`;
+    el.innerHTML = `<div class="empty">No raw trades stored yet for ${symbol}.<br>Waiting for the Flink JDBC sink to populate Postgres.</div>`;
     return;
   }
   const trades = await res.json();

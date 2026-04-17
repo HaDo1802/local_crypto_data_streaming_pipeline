@@ -8,5 +8,6 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 COPY jobs/consumer/lakehouse/ /app/
 
 ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
 
 CMD ["python", "lake_writer.py"]

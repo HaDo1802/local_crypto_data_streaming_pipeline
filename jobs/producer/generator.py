@@ -1,115 +1,125 @@
 """
-generator.py — produces simulated crypto trade and order-book events to Kafka.
+generator.py — Binance WebSocket → Kafka producer (trades only).
 
-Trade events carry a realistic random-walk price.  Order-book snapshots carry
-the best bid/ask around that price.  10% of trades intentionally have no
-corresponding order-book update, exercising gap handling in the enricher.
+Subscribes to `<symbol>@trade` via a combined stream, maps payloads to the
+internal trade JSON contract, and publishes to Kafka for Flink / lakehouse.
+
+Local check (no Kafka):
+
+  cd jobs/producer && pip install -r requirements.txt
+  python generator.py --dry-run
+
+Optional: limit how many mapped events to print, then exit:
+
+  python generator.py --dry-run --max-events 25
 """
 
+from __future__ import annotations
+
+import argparse
 import json
-import math
 import os
-import random
+import sys
 import time
-import uuid
-from dataclasses import dataclass, field
-from typing import Dict
+from pathlib import Path
+from typing import Any, Optional
 
 import jsonschema
 from confluent_kafka import Producer
 
+try:
+    import websocket
+except ImportError as e:  # pragma: no cover
+    raise SystemExit(
+        "Install dependencies: pip install -r requirements.txt"
+    ) from e
+
 # ── Config ───────────────────────────────────────────────────────────────────
-BOOTSTRAP_SERVERS = os.getenv("BOOTSTRAP_SERVERS", "localhost:9092")
+BOOTSTRAP_SERVERS = os.getenv("BOOTSTRAP_SERVERS", "localhost:19092")
 TRADES_TOPIC = os.getenv("TRADES_TOPIC", "trades")
-ORDERBOOK_TOPIC = os.getenv("ORDERBOOK_TOPIC", "orderbook")
-INTERVAL_SEC = float(os.getenv("TRADE_INTERVAL_SEC", "0.3"))
-SYMBOLS_RAW = os.getenv("SYMBOLS", "BTC-USD,ETH-USD,SOL-USD,BNB-USD,XRP-USD")
-SYMBOLS = [s.strip() for s in SYMBOLS_RAW.split(",")]
 
-TRADE_SCHEMA_PATH = os.getenv("TRADE_SCHEMA_PATH", "/app/schemas/trade.schema.json")
-OB_SCHEMA_PATH = os.getenv("OB_SCHEMA_PATH", "/app/schemas/orderbook.schema.json")
+# Binance spot combined stream base (see Binance WebSocket API docs)
+BINANCE_WSS_BASE = os.getenv("BINANCE_WSS_BASE", "wss://stream.binance.com:9443").rstrip("/")
 
-# Base prices for simulated symbols
-BASE_PRICES: Dict[str, float] = {
-    "BTC-USD": 65_000.0,
-    "ETH-USD": 3_200.0,
-    "SOL-USD": 150.0,
-    "BNB-USD": 580.0,
-    "XRP-USD": 0.60,
-}
-
-# Typical spread as % of price
-SPREAD_PCT: Dict[str, float] = {
-    "BTC-USD": 0.01,
-    "ETH-USD": 0.02,
-    "SOL-USD": 0.05,
-    "BNB-USD": 0.03,
-    "XRP-USD": 0.10,
-}
-
-# Volatility — std-dev of log-return per tick
-VOLATILITY: Dict[str, float] = {
-    "BTC-USD": 0.0008,
-    "ETH-USD": 0.0010,
-    "SOL-USD": 0.0015,
-    "BNB-USD": 0.0012,
-    "XRP-USD": 0.0020,
-}
+# Comma-separated *lowercase* symbols, e.g. btcusdt,ethusdt (Binance stream names)
+SYMBOLS_RAW = os.getenv(
+    "SYMBOLS",
+    "btcusdt,ethusdt,solusdt,bnbusdt,xrpusdt",
+)
+SYMBOLS = [s.strip().lower() for s in SYMBOLS_RAW.split(",") if s.strip()]
 
 
-@dataclass
-class SymbolState:
-    price: float
-    spread_pct: float
-    volatility: float
-    tick_sizes: Dict[str, float] = field(default_factory=dict)
+def _resolve_schema_path(env_key: str, filename: str) -> str:
+    p = os.getenv(env_key)
+    if p:
+        return p
+    local_candidate = Path(__file__).resolve().parent / "schemas" / filename
+    if local_candidate.is_file():
+        return str(local_candidate)
 
-    def next_price(self) -> float:
-        """Geometric Brownian Motion step."""
-        log_ret = random.gauss(0, self.volatility)
-        self.price = self.price * math.exp(log_ret)
-        return round(self.price, 6)
+    repo_root = Path(__file__).resolve().parent
+    for _ in range(3):
+        candidate = repo_root / "schemas" / filename
+        if candidate.is_file():
+            return str(candidate)
+        repo_root = repo_root.parent
+
+    return f"/app/schemas/{filename}"
+
+
+TRADE_SCHEMA_PATH = _resolve_schema_path("TRADE_SCHEMA_PATH", "trade.schema.json")
 
 
 def _load_schema(path: str) -> dict:
     try:
-        with open(path, "r") as f:
+        with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
     except FileNotFoundError:
-        return {}  # schema validation optional if file missing
+        return {}
 
 
 TRADE_SCHEMA = _load_schema(TRADE_SCHEMA_PATH)
-OB_SCHEMA = _load_schema(OB_SCHEMA_PATH)
 
 
-def build_trade(symbol: str, state: SymbolState) -> dict:
-    price = state.next_price()
-    qty = round(random.uniform(0.001, 5.0), 6)
+def build_combined_stream_url(symbols: list[str]) -> str:
+    """One connection: streams=<sym>@trade/<sym>@trade/..."""
+    streams = "/".join(f"{sym}@trade" for sym in symbols)
+    return f"{BINANCE_WSS_BASE}/stream?streams={streams}"
+
+
+def map_binance_trade(data: dict) -> dict:
+    """Binance `trade` event → internal trade record."""
+    sym = str(data["s"])
+    tid = data["t"]
+    # m: is buyer the market maker? True → aggressive seller
+    side = "sell" if data["m"] else "buy"
     return {
-        "trade_id": str(uuid.uuid4()),
-        "symbol": symbol,
-        "price": price,
-        "quantity": qty,
-        "side": random.choice(["buy", "sell"]),
-        "event_time": int(time.time() * 1000),  # epoch ms
+        "trade_id": f"{sym}-{tid}",
+        "symbol": sym,
+        "price": float(data["p"]),
+        "quantity": float(data["q"]),
+        "side": side,
+        "event_time": int(data["T"]),
     }
 
 
-def build_orderbook(symbol: str, mid_price: float, spread_pct: float) -> dict:
-    half_spread = mid_price * spread_pct / 100
-    bid = round(mid_price - half_spread, 6)
-    ask = round(mid_price + half_spread, 6)
-    bid_size = round(random.uniform(0.1, 10.0), 4)
-    ask_size = round(random.uniform(0.1, 10.0), 4)
-    return {
-        "symbol": symbol,
-        "bid_price": bid,
-        "bid_size": bid_size,
-        "ask_price": ask,
-        "ask_size": ask_size,
-        "event_time": int(time.time() * 1000),
-    }
+def parse_trade_message(raw: str) -> Optional[dict]:
+    """
+    Returns inner trade payload or None.
+    Handles combined stream wrapper: {"stream":"btcusdt@trade","data":{...}}
+    """
+    try:
+        msg = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+
+    data = msg.get("data", msg)
+    if isinstance(data, list) or not isinstance(data, dict):
+        return None
+
+    if data.get("e") == "trade":
+        return data
+    return None
 
 
 def validate(payload: dict, schema: dict) -> None:
@@ -119,7 +129,7 @@ def validate(payload: dict, schema: dict) -> None:
 
 def delivery_report(err, msg) -> None:
     if err:
-        print(f"[delivery-error] topic={msg.topic()} error={err}")
+        print(f"[delivery-error] topic={msg.topic()} error={err}", file=sys.stderr)
         return
     key = msg.key().decode() if msg.key() else "-"
     print(
@@ -128,59 +138,141 @@ def delivery_report(err, msg) -> None:
     )
 
 
-def main() -> None:
-    producer = Producer({"bootstrap.servers": BOOTSTRAP_SERVERS})
-
-    # Initialize per-symbol state
-    states: Dict[str, SymbolState] = {}
-    for sym in SYMBOLS:
-        base = BASE_PRICES.get(sym, 100.0)
-        states[sym] = SymbolState(
-            price=base,
-            spread_pct=SPREAD_PCT.get(sym, 0.05),
-            volatility=VOLATILITY.get(sym, 0.001),
-        )
-
-    print(f"Generator starting | brokers={BOOTSTRAP_SERVERS}")
+def run_kafka_loop(producer: Producer, verbose_delivery: bool = True) -> None:
+    url = build_combined_stream_url(SYMBOLS)
+    print(f"Binance → Kafka | brokers={BOOTSTRAP_SERVERS}")
     print(f"Symbols: {SYMBOLS}")
-    print(f"Interval: {INTERVAL_SEC}s")
+    print(f"WebSocket: {url[:80]}…")
 
-    sent = 0
-    try:
-        while True:
-            symbol = random.choice(SYMBOLS)
-            state = states[symbol]
-
-            # --- trade event ---
-            trade = build_trade(symbol, state)
-            validate(trade, TRADE_SCHEMA)
+    def on_message(_ws: Any, message: str) -> None:
+        raw_payload = parse_trade_message(message)
+        if not raw_payload:
+            return
+        try:
+            out = map_binance_trade(raw_payload)
+            validate(out, TRADE_SCHEMA)
             producer.poll(0)
             producer.produce(
                 topic=TRADES_TOPIC,
-                key=trade["symbol"].encode(),
-                value=json.dumps(trade).encode(),
-                callback=delivery_report,
+                key=out["symbol"].encode(),
+                value=json.dumps(out).encode(),
+                callback=delivery_report if verbose_delivery else None,
+            )
+        except Exception as exc:  # noqa: BLE001 — stream must stay up
+            print(f"[skip] {exc} | payload snippet={str(raw_payload)[:120]}", file=sys.stderr)
+
+    def on_error(_ws: Any, error: Any) -> None:
+        print(f"[ws-error] {error}", file=sys.stderr)
+
+    def on_close(_ws: Any, close_status_code: Any, close_msg: Any) -> None:
+        print(f"[ws-closed] code={close_status_code} msg={close_msg}")
+
+    backoff = 5.0
+    while True:
+        try:
+            ws = websocket.WebSocketApp(
+                url,
+                on_message=on_message,
+                on_error=on_error,
+                on_close=on_close,
+            )
+            ws.run_forever(ping_interval=20, ping_timeout=10)
+        except KeyboardInterrupt:
+            print("Generator stopped.")
+            break
+        except Exception as exc:  # noqa: BLE001
+            print(f"[ws] reconnecting in {backoff:.0f}s: {exc}", file=sys.stderr)
+            time.sleep(backoff)
+            backoff = min(backoff * 1.5, 120.0)
+            continue
+        backoff = 5.0
+        print("[ws] connection ended, reconnecting…", file=sys.stderr)
+        time.sleep(backoff)
+
+
+def run_dry_run(max_events: int) -> None:
+    url = build_combined_stream_url(SYMBOLS)
+    print(f"Dry run (no Kafka) — printing up to {max_events} trades", flush=True)
+    print(f"WebSocket: {url}\n", flush=True)
+
+    seen = 0
+    last_error: list[str] = []
+
+    def on_message(_ws: Any, message: str) -> None:
+        nonlocal seen
+        if seen >= max_events:
+            _ws.close()
+            return
+        raw_payload = parse_trade_message(message)
+        if not raw_payload:
+            return
+        try:
+            out = map_binance_trade(raw_payload)
+            validate(out, TRADE_SCHEMA)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[invalid] {exc} | {raw_payload!r}\n")
+            return
+        seen += 1
+        print(f"[{seen}/{max_events}] trade: {json.dumps(out)}")
+
+    def on_open(_ws: Any) -> None:
+        print("[ws] connected — waiting for Binance messages…\n")
+
+    def on_error(_ws: Any, error: Any) -> None:
+        msg = str(error)
+        last_error.append(msg)
+        print(f"[ws-error] {msg}", file=sys.stderr)
+        if "451" in msg or "restricted" in msg.lower():
+            print(
+                "\nHint: Binance may block WebSocket from your region (HTTP 451). "
+                "Try another network/VPN, or set BINANCE_WSS_BASE to a reachable endpoint.",
+                file=sys.stderr,
             )
 
-            # --- order-book snapshot (90% of the time) ---
-            if random.random() < 0.9:
-                ob = build_orderbook(symbol, state.price, state.spread_pct)
-                validate(ob, OB_SCHEMA)
-                producer.produce(
-                    topic=ORDERBOOK_TOPIC,
-                    key=ob["symbol"].encode(),
-                    value=json.dumps(ob).encode(),
-                    callback=delivery_report,
-                )
+    ws = websocket.WebSocketApp(
+        url,
+        on_open=on_open,
+        on_message=on_message,
+        on_error=on_error,
+    )
+    ws.run_forever(ping_interval=20, ping_timeout=10)
+    if seen == 0 and last_error:
+        print("\nNo events received; fix WebSocket errors above and retry.", file=sys.stderr)
+        sys.exit(1)
+    print("\nDone.")
 
-            sent += 1
-            if sent % 100 == 0:
-                print(f"[generator] {sent} trade events sent")
 
-            time.sleep(INTERVAL_SEC)
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Binance WebSocket → Kafka producer")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Do not connect to Kafka; print mapped trade JSON from Binance",
+    )
+    parser.add_argument(
+        "--max-events",
+        type=int,
+        default=20,
+        help="With --dry-run, stop after this many trades (default: 20)",
+    )
+    parser.add_argument(
+        "--quiet-delivery",
+        action="store_true",
+        help="Kafka mode: do not log per-message delivery callbacks",
+    )
+    args = parser.parse_args()
 
-    except KeyboardInterrupt:
-        print("Generator stopped.")
+    if not SYMBOLS:
+        print("SYMBOLS is empty; set SYMBOLS env (e.g. btcusdt,ethusdt)", file=sys.stderr)
+        sys.exit(1)
+
+    if args.dry_run:
+        run_dry_run(max(1, args.max_events))
+        return
+
+    producer = Producer({"bootstrap.servers": BOOTSTRAP_SERVERS})
+    try:
+        run_kafka_loop(producer, verbose_delivery=not args.quiet_delivery)
     finally:
         remaining = producer.flush(timeout=10)
         if remaining:

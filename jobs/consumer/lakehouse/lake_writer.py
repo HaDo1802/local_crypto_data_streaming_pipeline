@@ -90,6 +90,7 @@ class MinIOUploader:
         # Write to an in-memory buffer — no temp files needed
         buf = io.BytesIO()
         pq.write_table(table, buf, compression="snappy")
+        size_kb = buf.tell() / 1024
         buf.seek(0)
 
         self.part_counter[(dt, symbol)] += 1
@@ -99,7 +100,7 @@ class MinIOUploader:
         self.client.upload_fileobj(buf, MINIO_BUCKET, key)
         log.info(
             "Uploaded  s3://%s/%s  (%d rows, %.1f KB)",
-            MINIO_BUCKET, key, len(records), buf.tell() / 1024,
+            MINIO_BUCKET, key, len(records), size_kb,
         )
         return key
 

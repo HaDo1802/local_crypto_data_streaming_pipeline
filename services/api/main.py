@@ -1,44 +1,47 @@
 """
-main.py — FastAPI backend for the crypto streaming dashboard.
+FastAPI serving layer for the streaming demo.
 
-Endpoints:
-  GET  /                          → serves the dashboard HTML
-  GET  /api/symbols               → list of active symbols
-  GET  /api/ohlcv/{symbol}        → paginated OHLCV candles from Postgres
-  GET  /api/trades/{symbol}/latest → latest N raw trades
-  GET  /api/stats                 → pipeline-wide stats (candle count, etc.)
-  GET  /api/lake/files            → list Parquet files in MinIO lakehouse
-  WS   /ws/prices                 → live price tick stream via WebSocket
+The API intentionally stays thin:
+  - Postgres is the serving database for dashboard reads
+  - MinIO is exposed for lakehouse observability
+  - WebSockets publish the latest close per symbol
 """
 
+from __future__ import annotations
+
 import asyncio
-import json
+import contextlib
+import logging
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import AsyncGenerator, List, Optional
+from typing import Any
 
+import asyncpg
 import boto3
 from botocore.client import Config
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse
-from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-import asyncpg
 
-# ── Config ───────────────────────────────────────────────────────────────────
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    "postgresql://trader:trader@postgres:5432/crypto",
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [api] %(levelname)s %(message)s",
 )
+log = logging.getLogger(__name__)
+
+
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://trader:trader@postgres:5432/crypto")
 MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "http://minio:9000")
 MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "minioadmin")
 MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "minioadmin")
 MINIO_BUCKET = os.getenv("MINIO_BUCKET", "lakehouse")
-
 DASHBOARD_PATH = Path("/app/dashboard/index.html")
 
-# ── Pydantic models ──────────────────────────────────────────────────────────
+PRICE_POLL_INTERVAL_SECONDS = 2
+
+
 class OHLCVCandle(BaseModel):
     symbol: str
     window_start: str
@@ -66,18 +69,32 @@ class LakeFile(BaseModel):
     last_modified: str
 
 
-# ── DB connection pool ────────────────────────────────────────────────────────
-_pool: Optional[asyncpg.Pool] = None
+class ConnectionManager:
+    def __init__(self) -> None:
+        self.active: set[WebSocket] = set()
+
+    async def connect(self, websocket: WebSocket) -> None:
+        await websocket.accept()
+        self.active.add(websocket)
+
+    def disconnect(self, websocket: WebSocket) -> None:
+        self.active.discard(websocket)
+
+    async def broadcast(self, payload: dict[str, Any]) -> None:
+        stale: list[WebSocket] = []
+        for websocket in self.active:
+            try:
+                await websocket.send_json(payload)
+            except Exception:
+                stale.append(websocket)
+
+        for websocket in stale:
+            self.disconnect(websocket)
 
 
-async def get_pool() -> asyncpg.Pool:
-    global _pool
-    if _pool is None:
-        _pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=10)
-    return _pool
+manager = ConnectionManager()
 
 
-# ── MinIO client ─────────────────────────────────────────────────────────────
 def get_minio_client():
     return boto3.client(
         "s3",
@@ -89,202 +106,194 @@ def get_minio_client():
     )
 
 
-# ── WebSocket manager ─────────────────────────────────────────────────────────
-class ConnectionManager:
-    def __init__(self):
-        self.active: List[WebSocket] = []
-
-    async def connect(self, ws: WebSocket):
-        await ws.accept()
-        self.active.append(ws)
-
-    def disconnect(self, ws: WebSocket):
-        if ws in self.active:
-            self.active.remove(ws)
-
-    async def broadcast(self, data: dict):
-        dead = []
-        for ws in self.active:
-            try:
-                await ws.send_json(data)
-            except Exception:
-                dead.append(ws)
-        for ws in dead:
-            self.disconnect(ws)
-
-
-manager = ConnectionManager()
-
-
-# ── Lifespan: background price broadcaster ───────────────────────────────────
-async def price_broadcast_loop():
-    """Polls Postgres for the latest close price every 2 seconds and
-    broadcasts to all connected WebSocket clients."""
+async def price_broadcast_loop(pool: asyncpg.Pool) -> None:
     while True:
         try:
-            pool = await get_pool()
-            async with pool.acquire() as conn:
-                rows = await conn.fetch("""
-                    SELECT symbol, close_price, window_end
-                    FROM   latest_ohlcv
-                    ORDER BY symbol
-                """)
-            if rows and manager.active:
+            if manager.active:
+                async with pool.acquire() as conn:
+                    rows = await conn.fetch(
+                        """
+                        SELECT symbol, close_price, window_end
+                        FROM latest_ohlcv
+                        ORDER BY symbol
+                        """
+                    )
+
                 payload = {
                     "type": "price_update",
                     "prices": [
                         {
-                            "symbol": r["symbol"],
-                            "price": r["close_price"],
-                            "updated_at": str(r["window_end"]),
+                            "symbol": row["symbol"],
+                            "price": row["close_price"],
+                            "updated_at": row["window_end"].isoformat(),
                         }
-                        for r in rows
+                        for row in rows
                     ],
                 }
                 await manager.broadcast(payload)
-        except Exception:
-            pass  # DB may not be ready yet
-        await asyncio.sleep(2)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("price broadcast loop failed: %s", exc)
+
+        await asyncio.sleep(PRICE_POLL_INTERVAL_SECONDS)
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI) -> AsyncGenerator:
-    asyncio.create_task(price_broadcast_loop())
-    yield
-    global _pool
-    if _pool:
-        await _pool.close()
+async def lifespan(app: FastAPI):
+    pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
+    broadcaster = asyncio.create_task(price_broadcast_loop(pool))
+    app.state.db_pool = pool
+    app.state.broadcaster = broadcaster
+    try:
+        yield
+    finally:
+        broadcaster.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await broadcaster
+        await pool.close()
 
 
-# ── App ───────────────────────────────────────────────────────────────────────
 app = FastAPI(
     title="Crypto Streaming Dashboard API",
-    version="1.0.0",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
 
-# ── Routes ────────────────────────────────────────────────────────────────────
+def get_pool() -> asyncpg.Pool:
+    return app.state.db_pool
+
+
+@app.get("/healthz")
+async def healthz():
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("SELECT 1")
+    return {"status": "ok"}
+
+
 @app.get("/", response_class=HTMLResponse)
 async def dashboard():
-    if DASHBOARD_PATH.exists():
+    if DASHBOARD_PATH.is_file():
         return FileResponse(DASHBOARD_PATH)
-    return HTMLResponse("<h1>Dashboard not found. Mount services/dashboard at /app/dashboard.</h1>")
+    return HTMLResponse("<h1>Dashboard not found.</h1>", status_code=500)
 
 
-@app.get("/api/symbols", response_model=List[str])
+@app.get("/api/symbols", response_model=list[str])
 async def list_symbols():
-    pool = await get_pool()
+    pool = get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch("SELECT DISTINCT symbol FROM ohlcv ORDER BY symbol")
-    return [r["symbol"] for r in rows]
+    return [row["symbol"] for row in rows]
 
 
-@app.get("/api/ohlcv/{symbol}", response_model=List[OHLCVCandle])
-async def get_ohlcv(
-    symbol: str,
-    limit: int = Query(default=60, le=500),
-):
-    pool = await get_pool()
+@app.get("/api/ohlcv/{symbol}", response_model=list[OHLCVCandle])
+async def get_ohlcv(symbol: str, limit: int = Query(default=60, ge=1, le=500)):
+    pool = get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT symbol, window_start, window_end,
-                   open_price, high_price, low_price, close_price,
-                   volume, trade_count
-            FROM   ohlcv
-            WHERE  symbol = $1
-            ORDER  BY window_start DESC
-            LIMIT  $2
+            SELECT
+                symbol,
+                window_start,
+                window_end,
+                open_price,
+                high_price,
+                low_price,
+                close_price,
+                volume,
+                trade_count
+            FROM ohlcv
+            WHERE symbol = $1
+            ORDER BY window_start DESC
+            LIMIT $2
             """,
-            symbol.upper(), limit,
+            symbol.upper(),
+            limit,
         )
+
     if not rows:
-        raise HTTPException(status_code=404, detail=f"No OHLCV data for {symbol}")
+        raise HTTPException(status_code=404, detail=f"No OHLCV data for {symbol.upper()}")
+
     return [
         OHLCVCandle(
-            symbol=r["symbol"],
-            window_start=str(r["window_start"]),
-            window_end=str(r["window_end"]),
-            open_price=r["open_price"],
-            high_price=r["high_price"],
-            low_price=r["low_price"],
-            close_price=r["close_price"],
-            volume=r["volume"],
-            trade_count=r["trade_count"],
+            symbol=row["symbol"],
+            window_start=row["window_start"].isoformat(),
+            window_end=row["window_end"].isoformat(),
+            open_price=row["open_price"],
+            high_price=row["high_price"],
+            low_price=row["low_price"],
+            close_price=row["close_price"],
+            volume=row["volume"],
+            trade_count=row["trade_count"],
         )
-        for r in reversed(rows)  # chronological order for charts
+        for row in reversed(rows)
     ]
 
 
-@app.get("/api/trades/{symbol}/latest", response_model=List[TradeRecord])
-async def get_latest_trades(
-    symbol: str,
-    limit: int = Query(default=50, le=200),
-):
-    pool = await get_pool()
+@app.get("/api/trades/{symbol}/latest", response_model=list[TradeRecord])
+async def get_latest_trades(symbol: str, limit: int = Query(default=50, ge=1, le=200)):
+    pool = get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
             SELECT trade_id, symbol, price, quantity, side, event_time
-            FROM   raw_trades
-            WHERE  symbol = $1
-            ORDER  BY event_time DESC
-            LIMIT  $2
+            FROM raw_trades
+            WHERE symbol = $1
+            ORDER BY event_time DESC
+            LIMIT $2
             """,
-            symbol.upper(), limit,
+            symbol.upper(),
+            limit,
         )
+
     if not rows:
-        raise HTTPException(status_code=404, detail=f"No trades found for {symbol}")
-    return [TradeRecord(**dict(r)) for r in rows]
+        raise HTTPException(status_code=404, detail=f"No trades found for {symbol.upper()}")
+
+    return [TradeRecord(**dict(row)) for row in rows]
 
 
 @app.get("/api/stats")
 async def pipeline_stats():
-    pool = await get_pool()
+    pool = get_pool()
     async with pool.acquire() as conn:
-        ohlcv_count = await conn.fetchval("SELECT COUNT(*) FROM ohlcv")
-        trade_count = await conn.fetchval("SELECT COUNT(*) FROM raw_trades")
-        symbols = await conn.fetchval("SELECT COUNT(DISTINCT symbol) FROM ohlcv")
-        latest_candle = await conn.fetchval(
-            "SELECT MAX(window_end) FROM ohlcv"
-        )
+        total_candles = await conn.fetchval("SELECT COUNT(*) FROM ohlcv")
+        total_trades = await conn.fetchval("SELECT COUNT(*) FROM raw_trades")
+        active_symbols = await conn.fetchval("SELECT COUNT(DISTINCT symbol) FROM ohlcv")
+        latest_candle = await conn.fetchval("SELECT MAX(window_end) FROM ohlcv")
+
     return {
-        "total_candles": ohlcv_count,
-        "total_trades_stored": trade_count,
-        "active_symbols": symbols,
-        "latest_candle_at": str(latest_candle) if latest_candle else None,
+        "total_candles": total_candles,
+        "total_trades_stored": total_trades,
+        "active_symbols": active_symbols,
+        "latest_candle_at": latest_candle.isoformat() if latest_candle else None,
     }
 
 
-@app.get("/api/lake/files", response_model=List[LakeFile])
-async def list_lake_files(prefix: str = "trades/", max_keys: int = Query(default=50, le=200)):
+@app.get("/api/lake/files", response_model=list[LakeFile])
+async def list_lake_files(prefix: str = "trades/", max_keys: int = Query(default=50, ge=1, le=200)):
     try:
         client = get_minio_client()
-        response = client.list_objects_v2(
-            Bucket=MINIO_BUCKET,
-            Prefix=prefix,
-            MaxKeys=max_keys,
-        )
-        files = []
-        for obj in response.get("Contents", []):
-            files.append(LakeFile(
-                key=obj["Key"],
-                size_kb=round(obj["Size"] / 1024, 2),
-                last_modified=obj["LastModified"].isoformat(),
-            ))
-        return files
+        response = client.list_objects_v2(Bucket=MINIO_BUCKET, Prefix=prefix, MaxKeys=max_keys)
     except Exception as exc:
-        raise HTTPException(status_code=503, detail=f"MinIO unavailable: {exc}")
+        raise HTTPException(status_code=503, detail=f"MinIO unavailable: {exc}") from exc
+
+    return [
+        LakeFile(
+            key=obj["Key"],
+            size_kb=round(obj["Size"] / 1024, 2),
+            last_modified=obj["LastModified"].isoformat(),
+        )
+        for obj in response.get("Contents", [])
+    ]
 
 
-# ── WebSocket: live price stream ──────────────────────────────────────────────
 @app.websocket("/ws/prices")
 async def websocket_prices(websocket: WebSocket):
     await manager.connect(websocket)
     try:
         while True:
-            # Keep-alive — actual data pushed by broadcast loop
             await websocket.receive_text()
     except WebSocketDisconnect:
         manager.disconnect(websocket)

@@ -1,0 +1,129 @@
+# Crypto Streaming Platform
+
+Clean local streaming architecture using Binance trades, Kafka, Flink, MinIO, Postgres, and a dashboard.
+
+## Architecture
+
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                               Docker Network                                 │
+│                                                                              │
+│   ┌────────────────────┐   trades stream   ┌──────────────────────────────┐  │
+│   │  Binance WebSocket │ ─────────────────►│        generator             │  │
+│   │      API source    │                   │        (Python)              │  │
+│   └────────────────────┘                   └──────────────┬───────────────┘  │
+│                                                           │                  │
+│                                                           │ publishes        │
+│                                                           ▼                  │
+│                                         ┌──────────────────────────────────┐ │
+│                                         │              Kafka               │ │
+│                                         │       topic: trades (x3)         │ │
+│                                         │       single broker, KRaft       │ │
+│                                         └──────────────┬───────────────────┘ │
+│                                                        │                     │
+│                             ┌──────────────────────────┴─────────────────┐   │
+│                             │                                            │   │
+│                  ┌──────────▼──────────┐                      ┌──────────▼──┐│
+│                  │  Flink Aggregator   │                      │ lake-writer ││
+│                  │ crypto-price-       │                      │   (Python)  ││
+│                  │ aggregator          │                      │             ││
+│                  │                     │                      │ reads trades││
+│                  │ reads: trades       │                      │ writes raw  ││
+│                  │ window: 10s         │                      │ parquet to  ││
+│                  │ parallelism: 3      │                      │ MinIO       ││
+│                  └───────┬─────────────┘                      └──────┬──────┘│
+│                          │                                           │       │
+│            ┌─────────────┴─────────────┐                 ┌──────────▼──────┐ │
+│            │                           │                 │      MinIO      │ │
+│   ┌────────▼────────┐        ┌─────────▼────────┐        │ lakehouse/trades│ │
+│   │    Postgres     │        │    Postgres      │        │    Parquet      │ │
+│   │   raw_trades    │        │      ohlcv       │        └─────────────────┘ │
+│   │ latest trade    │        │ windowed candles │                            │
+│   └────────┬────────┘        └─────────┬────────┘                            │
+│            │                           │                                     │
+│            └───────────────┬───────────┘                                     │
+│                            ▼                                                 │
+│                    ┌───────────────────┐                                     │
+│                    │      FastAPI      │                                     │
+│                    │ dashboard + API   │                                     │
+│                    │ websocket prices  │                                     │
+│                    └─────────┬─────────┘                                     │
+│                              │                                               │
+│                              ▼                                               │
+│                        ┌─────────────┐                                       │
+│                        │ Dashboard   │                                       │
+│                        └─────────────┘                                       │
+│                                                                              │
+│   Local observability UIs:                                                   │
+│   • Kafka UI   -> localhost:8080                                             │
+│   • Flink UI   -> localhost:8082                                             │
+│   • MinIO UI   -> localhost:9001                                             │
+│   • Dashboard  -> localhost:8000                                             │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
+
+## Run
+
+1. Copy the environment file.
+
+```bash
+cp .env.example .env
+```
+
+2. Start the full platform.
+
+```bash
+COMPOSE_BAKE=true docker compose up -d --build
+```
+
+3. Open the UIs.
+
+- Dashboard: `http://localhost:8000`
+- Kafka UI: `http://localhost:8080`
+- Flink UI: `http://localhost:8082`
+- MinIO Console: `http://localhost:9001`
+
+## Expected Output
+
+After startup, the expected steady-state is:
+
+- `generator` is publishing Binance trade events into Kafka
+- `price-aggregator` is running as one continuous Flink job
+- `lake-writer` is writing Parquet files into MinIO
+- the dashboard is reading candles and latest trades from Postgres
+- Kafka UI shows the `trades` topic and the `lake-writer` consumer group
+- Flink UI shows a running job named `crypto-price-aggregator`
+
+Useful check:
+
+```bash
+docker compose ps
+```
+
+You should see these services up:
+
+- `kafka`
+- `kafka-ui`
+- `flink-jobmanager`
+- `flink-taskmanager`
+- `price-aggregator`
+- `generator`
+- `lake-writer`
+- `postgres`
+- `minio`
+- `api`
+
+## Screenshots
+
+### Flink runtime after load stabilizes
+
+![Flink Stable Runtime](image/flink.png)
+
+### Dashboard
+
+![Dashboard](image/dashboard.png)
+
+### MinIO
+
+![MinIO](image/minio.png)
+

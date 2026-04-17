@@ -1,35 +1,35 @@
-# Data flow: jobs/producer → Kafka → jobs/consumer (Flink + lakehouse)
-# Web: services/api + services/dashboard
+name: local_streaming_project_finance
+
+x-kafka-bootstrap: &kafka-bootstrap kafka:9092
+x-flink-image: &flink-image local_streaming_project_finance-flink:latest
 
 services:
-  # ── Kafka cluster (3-broker KRaft, no ZooKeeper) ────────────────────────────
-  kafka-1:
+  kafka:
     image: apache/kafka:4.0.0
-    container_name: kafka_1
-    hostname: kafka-1
+    hostname: kafka
     ports:
-      - "19094:9094"
+      - "19092:19092"
     environment:
       KAFKA_KRAFT_MODE: "true"
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
-      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka-1:9093,2@kafka-2:9093,3@kafka-3:9093
-      KAFKA_LISTENERS: PLAINTEXT://:9092,PLAINTEXT_HOST://:9094,CONTROLLER://:9093
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-1:9092,PLAINTEXT_HOST://localhost:19094
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: PLAINTEXT://:9092,PLAINTEXT_HOST://:19092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:19092
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT,CONTROLLER:PLAINTEXT
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
       KAFKA_NUM_PARTITIONS: 3
-      KAFKA_DEFAULT_REPLICATION_FACTOR: 3
-      KAFKA_MIN_INSYNC_REPLICAS: 2
-      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
-      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
-      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 1
+      KAFKA_MIN_INSYNC_REPLICAS: 1
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_LOG_DIRS: /var/lib/kafka/data
       CLUSTER_ID: CryptoStreamCluster01
     volumes:
-      - kafka_1_data:/var/lib/kafka/data
+      - kafka_data:/var/lib/kafka/data
     healthcheck:
       test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
       interval: 5s
@@ -37,266 +37,132 @@ services:
       retries: 20
       start_period: 20s
 
-  kafka-2:
-    image: apache/kafka:4.0.0
-    container_name: kafka_2
-    hostname: kafka-2
-    ports:
-      - "29094:9094"
-    environment:
-      KAFKA_KRAFT_MODE: "true"
-      KAFKA_NODE_ID: 2
-      KAFKA_PROCESS_ROLES: broker,controller
-      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka-1:9093,2@kafka-2:9093,3@kafka-3:9093
-      KAFKA_LISTENERS: PLAINTEXT://:9092,PLAINTEXT_HOST://:9094,CONTROLLER://:9093
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-2:9092,PLAINTEXT_HOST://localhost:29094
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT,CONTROLLER:PLAINTEXT
-      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
-      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
-      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
-      KAFKA_NUM_PARTITIONS: 3
-      KAFKA_DEFAULT_REPLICATION_FACTOR: 3
-      KAFKA_MIN_INSYNC_REPLICAS: 2
-      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
-      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
-      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
-      KAFKA_LOG_DIRS: /var/lib/kafka/data
-      CLUSTER_ID: CryptoStreamCluster01
-    volumes:
-      - kafka_2_data:/var/lib/kafka/data
-    healthcheck:
-      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
-      interval: 5s
-      timeout: 5s
-      retries: 20
-      start_period: 20s
-
-  kafka-3:
-    image: apache/kafka:4.0.0
-    container_name: kafka_3
-    hostname: kafka-3
-    ports:
-      - "39094:9094"
-    environment:
-      KAFKA_KRAFT_MODE: "true"
-      KAFKA_NODE_ID: 3
-      KAFKA_PROCESS_ROLES: broker,controller
-      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka-1:9093,2@kafka-2:9093,3@kafka-3:9093
-      KAFKA_LISTENERS: PLAINTEXT://:9092,PLAINTEXT_HOST://:9094,CONTROLLER://:9093
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-3:9092,PLAINTEXT_HOST://localhost:39094
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT,CONTROLLER:PLAINTEXT
-      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
-      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
-      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
-      KAFKA_NUM_PARTITIONS: 3
-      KAFKA_DEFAULT_REPLICATION_FACTOR: 3
-      KAFKA_MIN_INSYNC_REPLICAS: 2
-      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
-      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
-      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
-      KAFKA_LOG_DIRS: /var/lib/kafka/data
-      CLUSTER_ID: CryptoStreamCluster01
-    volumes:
-      - kafka_3_data:/var/lib/kafka/data
-    healthcheck:
-      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
-      interval: 5s
-      timeout: 5s
-      retries: 20
-      start_period: 20s
-
-  # ── Topic bootstrap ──────────────────────────────────────────────────────────
   kafka-init-topics:
     image: apache/kafka:4.0.0
-    container_name: kafka_init_topics
     depends_on:
-      kafka-1:
-        condition: service_healthy
-      kafka-2:
-        condition: service_healthy
-      kafka-3:
+      kafka:
         condition: service_healthy
     entrypoint: ["/bin/bash", "-lc"]
     command:
       - >
-        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka-1:9092,kafka-2:9092,kafka-3:9092
-          --create --if-not-exists --topic trades --partitions 3 --replication-factor 3 &&
-        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka-1:9092,kafka-2:9092,kafka-3:9092
-          --create --if-not-exists --topic orderbook --partitions 3 --replication-factor 3 &&
-        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka-1:9092,kafka-2:9092,kafka-3:9092
-          --create --if-not-exists --topic trades-enriched --partitions 3 --replication-factor 3 &&
-        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka-1:9092,kafka-2:9092,kafka-3:9092 --list &&
-        echo "Topics created successfully."
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092
+        --create --if-not-exists --topic trades --partitions 3 --replication-factor 1 &&
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --list &&
+        echo "Kafka topics ready."
 
-  # ── Kafka UI ─────────────────────────────────────────────────────────────────
   kafka-ui:
     image: provectuslabs/kafka-ui:latest
-    container_name: kafka_ui
     ports:
       - "8080:8080"
     environment:
       KAFKA_CLUSTERS_0_NAME: crypto-streaming
-      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka-1:9092,kafka-2:9092,kafka-3:9092
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: *kafka-bootstrap
     depends_on:
-      kafka-1:
-        condition: service_healthy
-      kafka-2:
-        condition: service_healthy
-      kafka-3:
+      kafka:
         condition: service_healthy
 
-  # ── Consumer: Flink cluster (job JARs mounted from jobs/consumer/flink) ───────
-  flink-jobmanager:
-    build:
-      context: .
-      dockerfile: docker/Dockerfile.flink
-    container_name: flink-jobmanager
-    hostname: flink-jobmanager
-    ports:
-      - "8082:8081"   # Flink Web UI
-    command: jobmanager
-    environment:
-      - |
-        FLINK_PROPERTIES=
-        jobmanager.rpc.address: flink-jobmanager
-        taskmanager.numberOfTaskSlots: 4
-        parallelism.default: 2
-        state.backend: hashmap
-        state.checkpoints.dir: file:///tmp/flink-checkpoints
-        heartbeat.timeout: 60000
-    volumes:
-      - ./jobs/consumer/flink:/opt/flink/jobs
-      - flink_checkpoints:/tmp/flink-checkpoints
-    healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:8081/overview || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 12
-      start_period: 30s
-
-  flink-taskmanager-1:
-    build:
-      context: .
-      dockerfile: docker/Dockerfile.flink
-    container_name: flink-taskmanager-1
-    hostname: flink-taskmanager-1
-    depends_on:
-      flink-jobmanager:
-        condition: service_healthy
-    command: taskmanager
-    environment:
-      - |
-        FLINK_PROPERTIES=
-        jobmanager.rpc.address: flink-jobmanager
-        taskmanager.numberOfTaskSlots: 4
-        parallelism.default: 2
-        state.backend: hashmap
-        state.checkpoints.dir: file:///tmp/flink-checkpoints
-    volumes:
-      - ./jobs/consumer/flink:/opt/flink/jobs
-      - flink_checkpoints:/tmp/flink-checkpoints
-
-  flink-taskmanager-2:
-    build:
-      context: .
-      dockerfile: docker/Dockerfile.flink
-    container_name: flink-taskmanager-2
-    hostname: flink-taskmanager-2
-    depends_on:
-      flink-jobmanager:
-        condition: service_healthy
-    command: taskmanager
-    environment:
-      - |
-        FLINK_PROPERTIES=
-        jobmanager.rpc.address: flink-jobmanager
-        taskmanager.numberOfTaskSlots: 4
-        parallelism.default: 2
-        state.backend: hashmap
-        state.checkpoints.dir: file:///tmp/flink-checkpoints
-    volumes:
-      - ./jobs/consumer/flink:/opt/flink/jobs
-      - flink_checkpoints:/tmp/flink-checkpoints
-
-  # ── Postgres (OHLCV + trades sink) ──────────────────────────────────────────
   postgres:
     image: postgres:16
-    container_name: postgres
     ports:
       - "5433:5432"
     environment:
-      POSTGRES_DB: ${POSTGRES_DB:-crypto}
-      POSTGRES_USER: ${POSTGRES_USER:-trader}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-trader}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./sql/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-trader} -d ${POSTGRES_DB:-crypto}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
       interval: 5s
       timeout: 5s
       retries: 20
 
-  # ── MinIO (S3-compatible lakehouse) ──────────────────────────────────────────
   minio:
     image: minio/minio:latest
-    container_name: minio
     ports:
-      - "9000:9000"   # API
-      - "9001:9001"   # Console UI
+      - "9000:9000"
+      - "9001:9001"
     environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
     command: server /data --console-address ":9001"
     volumes:
       - minio_data:/data
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:9000/minio/health/live || exit 1"]
+      test: ["CMD-SHELL", "curl -sf http://localhost:9000/minio/health/live >/dev/null"]
       interval: 5s
       timeout: 5s
       retries: 20
 
-  # Creates the lakehouse bucket on first start
   minio-init:
     image: minio/mc:latest
-    container_name: minio_init
     depends_on:
       minio:
         condition: service_healthy
     entrypoint: ["/bin/sh", "-c"]
     command:
       - >
-        mc alias set local http://minio:9000 ${MINIO_ROOT_USER:-minioadmin} ${MINIO_ROOT_PASSWORD:-minioadmin} &&
+        mc alias set local http://minio:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD} &&
         mc mb --ignore-existing local/lakehouse &&
         mc mb --ignore-existing local/lakehouse/trades &&
-        mc mb --ignore-existing local/lakehouse/ohlcv &&
         echo "MinIO buckets ready."
 
-  # ── Producer: synthetic events → Kafka ───────────────────────────────────────
-  generator:
-    build:
-      context: .
-      dockerfile: docker/Dockerfile.generator
-    container_name: crypto_generator
-    environment:
-      BOOTSTRAP_SERVERS: kafka-1:9092,kafka-2:9092,kafka-3:9092
-      TRADES_TOPIC: trades
-      ORDERBOOK_TOPIC: orderbook
-      TRADE_INTERVAL_SEC: "0.3"
-      SYMBOLS: "BTC-USD,ETH-USD,SOL-USD,BNB-USD,XRP-USD"
-    depends_on:
-      kafka-init-topics:
-        condition: service_completed_successfully
-    volumes:
-      - ./schemas:/app/schemas
-    restart: on-failure
-
-  # ── Consumer: Flink — OHLCV aggregator (always runs) ───────────────────────────
-  price-aggregator:
+  flink-jobmanager:
+    image: *flink-image
     build:
       context: .
       dockerfile: docker/Dockerfile.flink
-    container_name: flink_price_aggregator
+    hostname: flink-jobmanager
+    command: jobmanager
+    ports:
+      - "8082:8081"
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.numberOfTaskSlots: 4
+        parallelism.default: 3
+        state.backend: hashmap
+        state.checkpoints.dir: file:///tmp/flink-checkpoints
+        execution.checkpointing.interval: 30s
+        execution.checkpointing.mode: EXACTLY_ONCE
+        execution.checkpointing.externalized-checkpoint-retention: RETAIN_ON_CANCELLATION
+    volumes:
+      - flink_checkpoints:/tmp/flink-checkpoints
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8081/overview >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  flink-taskmanager:
+    image: *flink-image
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.flink
+    hostname: flink-taskmanager
+    command: taskmanager
+    depends_on:
+      flink-jobmanager:
+        condition: service_healthy
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.numberOfTaskSlots: 4
+        parallelism.default: 3
+        state.backend: hashmap
+        state.checkpoints.dir: file:///tmp/flink-checkpoints
+        execution.checkpointing.interval: 30s
+        execution.checkpointing.mode: EXACTLY_ONCE
+    volumes:
+      - flink_checkpoints:/tmp/flink-checkpoints
+
+  price-aggregator:
+    image: *flink-image
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.flink
     restart: on-failure
     depends_on:
       flink-jobmanager:
@@ -306,66 +172,40 @@ services:
       postgres:
         condition: service_healthy
     environment:
-      BOOTSTRAP_SERVERS: kafka-1:9092,kafka-2:9092,kafka-3:9092
+      BOOTSTRAP_SERVERS: *kafka-bootstrap
       TRADES_TOPIC: trades
-      POSTGRES_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB:-crypto}
-      POSTGRES_USER: ${POSTGRES_USER:-trader}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-trader}
-      WINDOW_MINUTES: "1"
-      FLINK_JOBMANAGER: flink-jobmanager:8081
-    volumes:
-      - ./jobs/consumer/flink:/opt/flink/jobs
+      POSTGRES_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      WINDOW_SECONDS: "10"
+      ENABLE_CONSOLE_SINK: "false"
     entrypoint:
       - "bash"
-      - "-c"
+      - "-lc"
       - >
-        echo "Waiting for Flink cluster..." &&
-        sleep 5 &&
         /opt/flink/bin/flink run
         --jobmanager flink-jobmanager:8081
         --python /opt/flink/jobs/price_aggregator.py
-        --pyFiles /opt/flink/jobs/
-        -D parallelism.default=2
+        -D parallelism.default=3
 
-  # ── Consumer: Flink — stream-stream enricher (optional profile) ─────────────
-  trade-enricher:
+  generator:
     build:
       context: .
-      dockerfile: docker/Dockerfile.flink
-    container_name: flink_trade_enricher
-    profiles: ["enrich"]
+      dockerfile: docker/Dockerfile.generator
     restart: on-failure
+    environment:
+      BOOTSTRAP_SERVERS: *kafka-bootstrap
+      TRADES_TOPIC: trades
+      SYMBOLS: "btcusdt,ethusdt,solusdt,bnbusdt,xrpusdt"
+      BINANCE_WSS_BASE: "wss://data-stream.binance.vision"
     depends_on:
-      flink-jobmanager:
-        condition: service_healthy
       kafka-init-topics:
         condition: service_completed_successfully
-    environment:
-      BOOTSTRAP_SERVERS: kafka-1:9092,kafka-2:9092,kafka-3:9092
-      TRADES_TOPIC: trades
-      ORDERBOOK_TOPIC: orderbook
-      OUTPUT_TOPIC: trades-enriched
-      FLINK_JOBMANAGER: flink-jobmanager:8081
-    volumes:
-      - ./jobs/consumer/flink:/opt/flink/jobs
-    entrypoint:
-      - "bash"
-      - "-c"
-      - >
-        echo "Waiting for Flink cluster..." &&
-        sleep 5 &&
-        /opt/flink/bin/flink run
-        --jobmanager flink-jobmanager:8081
-        --python /opt/flink/jobs/trade_enricher.py
-        --pyFiles /opt/flink/jobs/
-        -D parallelism.default=2
 
-  # ── Consumer: lakehouse — Kafka → MinIO Parquet ──────────────────────────────
   lake-writer:
     build:
       context: .
       dockerfile: docker/Dockerfile.lake
-    container_name: lake_writer
     restart: on-failure
     depends_on:
       kafka-init-topics:
@@ -373,45 +213,36 @@ services:
       minio-init:
         condition: service_completed_successfully
     environment:
-      BOOTSTRAP_SERVERS: kafka-1:9092,kafka-2:9092,kafka-3:9092
+      BOOTSTRAP_SERVERS: *kafka-bootstrap
       TRADES_TOPIC: trades
       MINIO_ENDPOINT: http://minio:9000
-      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
-      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
       MINIO_BUCKET: lakehouse
       FLUSH_INTERVAL_SEC: "60"
       FLUSH_BATCH_SIZE: "500"
-    volumes:
-      - ./jobs/consumer/lakehouse:/app
 
-  # ── Web: FastAPI + static dashboard ───────────────────────────────────────────
   api:
     build:
       context: .
       dockerfile: docker/Dockerfile.api
-    container_name: crypto_api
     ports:
       - "8000:8000"
     environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-trader}:${POSTGRES_PASSWORD:-trader}@postgres:5432/${POSTGRES_DB:-crypto}
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       MINIO_ENDPOINT: http://minio:9000
-      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
-      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
       MINIO_BUCKET: lakehouse
     depends_on:
       postgres:
         condition: service_healthy
       minio:
         condition: service_healthy
-    volumes:
-      - ./services/api:/app
-      - ./services/dashboard:/app/dashboard
     restart: on-failure
 
 volumes:
-  kafka_1_data:
-  kafka_2_data:
-  kafka_3_data:
+  kafka_data:
   postgres_data:
   minio_data:
   flink_checkpoints:
