@@ -38,6 +38,132 @@ def execute(table_env: TableEnvironment, statement: str) -> None:
     table_env.execute_sql(statement)
 
 
+def kafka_source_ddl(brokers: str, topic: str) -> str:
+    """Return the Kafka source DDL for raw trades."""
+    return f"""
+    CREATE TABLE trades (
+        trade_id STRING,
+        symbol STRING,
+        price DOUBLE,
+        quantity DOUBLE,
+        side STRING,
+        event_time BIGINT,
+        ts AS TO_TIMESTAMP_LTZ(event_time, 3),
+        WATERMARK FOR ts AS ts - INTERVAL '5' SECOND
+    ) WITH (
+        'connector' = 'kafka',
+        'topic' = '{sql_literal(topic)}',
+        'properties.bootstrap.servers' = '{sql_literal(brokers)}',
+        'properties.group.id' = 'flink-price-aggregator',
+        'scan.startup.mode' = 'earliest-offset',
+        'format' = 'json',
+        'json.ignore-parse-errors' = 'true'
+    )
+    """
+
+
+def raw_trades_sink_ddl(pg_url: str, pg_user: str, pg_password: str) -> str:
+    """Return the JDBC sink DDL for raw trades."""
+    return f"""
+    CREATE TABLE raw_trades_sink (
+        trade_id STRING,
+        symbol STRING,
+        price DOUBLE,
+        quantity DOUBLE,
+        side STRING,
+        event_time BIGINT,
+        PRIMARY KEY (trade_id) NOT ENFORCED
+    ) WITH (
+        'connector' = 'jdbc',
+        'url' = '{sql_literal(pg_url)}',
+        'table-name' = 'raw_trades',
+        'username' = '{sql_literal(pg_user)}',
+        'password' = '{sql_literal(pg_password)}',
+        'driver' = 'org.postgresql.Driver'
+    )
+    """
+
+
+def ohlcv_sink_ddl(pg_url: str, pg_user: str, pg_password: str) -> str:
+    """Return the JDBC sink DDL for OHLCV candles."""
+    return f"""
+    CREATE TABLE ohlcv_sink (
+        symbol STRING,
+        window_start TIMESTAMP(3),
+        window_end TIMESTAMP(3),
+        open_price DOUBLE,
+        high_price DOUBLE,
+        low_price DOUBLE,
+        close_price DOUBLE,
+        volume DOUBLE,
+        trade_count BIGINT,
+        PRIMARY KEY (symbol, window_start) NOT ENFORCED
+    ) WITH (
+        'connector' = 'jdbc',
+        'url' = '{sql_literal(pg_url)}',
+        'table-name' = 'ohlcv',
+        'username' = '{sql_literal(pg_user)}',
+        'password' = '{sql_literal(pg_password)}',
+        'driver' = 'org.postgresql.Driver'
+    )
+    """
+
+
+def console_sink_ddl() -> str:
+    """Return the print connector sink DDL for debugging."""
+    return """
+    CREATE TABLE console_sink (
+        symbol STRING,
+        window_start TIMESTAMP(3),
+        window_end TIMESTAMP(3),
+        open_price DOUBLE,
+        high_price DOUBLE,
+        low_price DOUBLE,
+        close_price DOUBLE,
+        volume DOUBLE,
+        trade_count BIGINT
+    ) WITH (
+        'connector' = 'print'
+    )
+    """
+
+
+def raw_trades_view_sql() -> str:
+    """Return the SQL for the normalized raw trades view."""
+    return """
+    SELECT
+        trade_id,
+        UPPER(symbol) AS symbol,
+        price,
+        quantity,
+        side,
+        event_time
+    FROM trades
+    """
+
+
+def ohlcv_view_sql(window_seconds: int) -> str:
+    """Return the SQL for the windowed OHLCV view."""
+    return f"""
+    -- Use MIN_BY/MAX_BY on event-time `ts` so open/close are stable even
+    -- when arrival order differs from the true event order under load.
+    SELECT
+        UPPER(symbol) AS symbol,
+        CAST(window_start AS TIMESTAMP(3)) AS window_start,
+        CAST(window_end AS TIMESTAMP(3)) AS window_end,
+        MIN_BY(price, ts) AS open_price,
+        MAX(price) AS high_price,
+        MIN(price) AS low_price,
+        MAX_BY(price, ts) AS close_price,
+        ROUND(SUM(quantity), 6) AS volume,
+        COUNT(*) AS trade_count
+    FROM TABLE(
+        TUMBLE(TABLE trades, DESCRIPTOR(ts), INTERVAL '{window_seconds}' SECOND)
+    )
+    GROUP BY symbol, window_start, window_end
+    """
+
+
 def build_table_env() -> TableEnvironment:
     config = Configuration()
     config.set_string("pipeline.name", "crypto-price-aggregator")
@@ -51,137 +177,25 @@ def build_table_env() -> TableEnvironment:
 
 
 def register_tables(table_env: TableEnvironment) -> None:
-    execute(
-        table_env,
-        f"""
-        CREATE TABLE trades (
-            trade_id STRING,
-            symbol STRING,
-            price DOUBLE,
-            quantity DOUBLE,
-            side STRING,
-            event_time BIGINT,
-            ts AS TO_TIMESTAMP_LTZ(event_time, 3),
-            WATERMARK FOR ts AS ts - INTERVAL '5' SECOND
-        ) WITH (
-            'connector' = 'kafka',
-            'topic' = '{sql_literal(TRADES_TOPIC)}',
-            'properties.bootstrap.servers' = '{sql_literal(KAFKA_BROKERS)}',
-            'properties.group.id' = 'flink-price-aggregator',
-            'scan.startup.mode' = 'earliest-offset',
-            'format' = 'json',
-            'json.ignore-parse-errors' = 'true'
-        )
-        """,
-    )
-
-    execute(
-        table_env,
-        f"""
-        CREATE TABLE raw_trades_sink (
-            trade_id STRING,
-            symbol STRING,
-            price DOUBLE,
-            quantity DOUBLE,
-            side STRING,
-            event_time BIGINT,
-            PRIMARY KEY (trade_id) NOT ENFORCED
-        ) WITH (
-            'connector' = 'jdbc',
-            'url' = '{sql_literal(POSTGRES_URL)}',
-            'table-name' = 'raw_trades',
-            'username' = '{sql_literal(POSTGRES_USER)}',
-            'password' = '{sql_literal(POSTGRES_PASSWORD)}',
-            'driver' = 'org.postgresql.Driver'
-        )
-        """,
-    )
-
-    execute(
-        table_env,
-        f"""
-        CREATE TABLE ohlcv_sink (
-            symbol STRING,
-            window_start TIMESTAMP(3),
-            window_end TIMESTAMP(3),
-            open_price DOUBLE,
-            high_price DOUBLE,
-            low_price DOUBLE,
-            close_price DOUBLE,
-            volume DOUBLE,
-            trade_count BIGINT,
-            PRIMARY KEY (symbol, window_start) NOT ENFORCED
-        ) WITH (
-            'connector' = 'jdbc',
-            'url' = '{sql_literal(POSTGRES_URL)}',
-            'table-name' = 'ohlcv',
-            'username' = '{sql_literal(POSTGRES_USER)}',
-            'password' = '{sql_literal(POSTGRES_PASSWORD)}',
-            'driver' = 'org.postgresql.Driver'
-        )
-        """,
-    )
+    # Build DDL in named helpers so each SQL contract is easier to read and
+    # test independently than large inline f-strings inside orchestration code.
+    execute(table_env, kafka_source_ddl(KAFKA_BROKERS, TRADES_TOPIC))
+    execute(table_env, raw_trades_sink_ddl(POSTGRES_URL, POSTGRES_USER, POSTGRES_PASSWORD))
+    execute(table_env, ohlcv_sink_ddl(POSTGRES_URL, POSTGRES_USER, POSTGRES_PASSWORD))
 
     if ENABLE_CONSOLE_SINK:
-        execute(
-            table_env,
-            """
-            CREATE TABLE console_sink (
-                symbol STRING,
-                window_start TIMESTAMP(3),
-                window_end TIMESTAMP(3),
-                open_price DOUBLE,
-                high_price DOUBLE,
-                low_price DOUBLE,
-                close_price DOUBLE,
-                volume DOUBLE,
-                trade_count BIGINT
-            ) WITH (
-                'connector' = 'print'
-            )
-            """,
-        )
+        execute(table_env, console_sink_ddl())
 
 
 def register_views(table_env: TableEnvironment) -> None:
     table_env.create_temporary_view(
         "raw_trades_view",
-        table_env.sql_query(
-            """
-            SELECT
-                trade_id,
-                UPPER(symbol) AS symbol,
-                price,
-                quantity,
-                side,
-                event_time
-            FROM trades
-            """
-        ),
+        table_env.sql_query(raw_trades_view_sql()),
     )
 
     table_env.create_temporary_view(
         "ohlcv_view",
-        table_env.sql_query(
-            f"""
-            -- Use MIN_BY/MAX_BY on event-time `ts` so open/close are stable even
-            -- when arrival order differs from the true event order under load.
-            SELECT
-                UPPER(symbol) AS symbol,
-                CAST(window_start AS TIMESTAMP(3)) AS window_start,
-                CAST(window_end AS TIMESTAMP(3)) AS window_end,
-                MIN_BY(price, ts) AS open_price,
-                MAX(price) AS high_price,
-                MIN(price) AS low_price,
-                MAX_BY(price, ts) AS close_price,
-                ROUND(SUM(quantity), 6) AS volume,
-                COUNT(*) AS trade_count
-            FROM TABLE(
-                TUMBLE(TABLE trades, DESCRIPTOR(ts), INTERVAL '{WINDOW_SECONDS}' SECOND)
-            )
-            GROUP BY symbol, window_start, window_end
-            """,
-        ),
+        table_env.sql_query(ohlcv_view_sql(WINDOW_SECONDS)),
     )
 
 

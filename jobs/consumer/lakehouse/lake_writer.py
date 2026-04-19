@@ -97,7 +97,25 @@ class MinIOUploader:
         part_n = self.part_counter[(dt, symbol)]
         key = f"trades/dt={dt}/symbol={symbol}/part-{part_n:05d}.parquet"
 
-        self.client.upload_fileobj(buf, MINIO_BUCKET, key)
+        # Retry a few times because object storage failures are often transient,
+        # and we want the flush loop to fail only after bounded recovery attempts.
+        for attempt, backoff_seconds in enumerate((2, 4, 8), start=1):
+            try:
+                buf.seek(0)
+                self.client.upload_fileobj(buf, MINIO_BUCKET, key)
+                break
+            except Exception:
+                if attempt == 3:
+                    raise
+                log.warning(
+                    "Upload retry %d/3 failed for s3://%s/%s; sleeping %ss",
+                    attempt,
+                    MINIO_BUCKET,
+                    key,
+                    backoff_seconds,
+                )
+                time.sleep(backoff_seconds)
+
         log.info(
             "Uploaded  s3://%s/%s  (%d rows, %.1f KB)",
             MINIO_BUCKET, key, len(records), size_kb,
