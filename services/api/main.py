@@ -21,13 +21,13 @@ import asyncpg
 import boto3
 from botocore.client import Config
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [api] %(levelname)s %(message)s",
+    format="%(asctime)s [api] %(levelname)s %(name)s %(message)s",
 )
 log = logging.getLogger(__name__)
 
@@ -131,12 +131,12 @@ async def price_broadcast_loop(pool: asyncpg.Pool) -> None:
                     ],
                 }
                 await manager.broadcast(payload)
+            await asyncio.sleep(PRICE_POLL_INTERVAL_SECONDS)
         except asyncio.CancelledError:
             raise
-        except Exception as exc:
-            log.warning("price broadcast loop failed: %s", exc)
-
-        await asyncio.sleep(PRICE_POLL_INTERVAL_SECONDS)
+        except Exception:
+            log.exception("price_broadcast_loop failed | retry_after_s=5")
+            await asyncio.sleep(5)
 
 
 @asynccontextmanager
@@ -171,6 +171,31 @@ async def healthz():
     async with pool.acquire() as conn:
         await conn.execute("SELECT 1")
     return {"status": "ok"}
+
+
+@app.get("/healthz/ready")
+async def healthz_ready():
+    """Readiness: Postgres (dashboard reads) and MinIO (lake) must both answer."""
+    failures: dict[str, str] = {}
+    pool = get_pool()
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute("SELECT 1")
+    except Exception as exc:
+        failures["postgres"] = str(exc)
+
+    try:
+        client = get_minio_client()
+        client.head_bucket(Bucket=MINIO_BUCKET)
+    except Exception as exc:
+        failures["minio"] = str(exc)
+
+    if failures:
+        return JSONResponse(
+            status_code=503,
+            content={"status": "not_ready", "dependencies": failures},
+        )
+    return {"status": "ready", "postgres": "ok", "minio": "ok"}
 
 
 @app.get("/", response_class=HTMLResponse)

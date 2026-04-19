@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import sys
 import time
@@ -26,6 +27,8 @@ from typing import Any, Optional
 
 import jsonschema
 from confluent_kafka import Producer
+
+log = logging.getLogger(__name__)
 
 try:
     import websocket
@@ -127,7 +130,7 @@ def validate(payload: dict, schema: dict) -> None:
         jsonschema.validate(instance=payload, schema=schema)
 
 
-def delivery_report(err, msg) -> None:
+def delivery_report_verbose(err, msg) -> None:
     if err:
         print(f"[delivery-error] topic={msg.topic()} error={err}", file=sys.stderr)
         return
@@ -138,11 +141,34 @@ def delivery_report(err, msg) -> None:
     )
 
 
-def run_kafka_loop(producer: Producer, verbose_delivery: bool = True) -> None:
+def make_delivery_summary_callback():
+    """Single-threaded producer callback: count successes, log every 1000 deliveries."""
+    total_delivered = [0]
+
+    def delivery_report(err, msg) -> None:
+        if err:
+            print(f"[delivery-error] topic={msg.topic()} error={err}", file=sys.stderr)
+            return
+        total_delivered[0] += 1
+        n = total_delivered[0]
+        if n % 1000 == 0:
+            log.info(
+                "Delivered %d messages | latest topic=%s partition=%d offset=%d",
+                n,
+                msg.topic(),
+                msg.partition(),
+                msg.offset(),
+            )
+
+    return delivery_report
+
+
+def run_kafka_loop(producer: Producer, verbose_delivery: bool = False) -> None:
     url = build_combined_stream_url(SYMBOLS)
     print(f"Binance → Kafka | brokers={BOOTSTRAP_SERVERS}")
     print(f"Symbols: {SYMBOLS}")
     print(f"WebSocket: {url[:80]}…")
+    delivery_cb = delivery_report_verbose if verbose_delivery else make_delivery_summary_callback()
 
     def on_message(_ws: Any, message: str) -> None:
         raw_payload = parse_trade_message(message)
@@ -156,7 +182,7 @@ def run_kafka_loop(producer: Producer, verbose_delivery: bool = True) -> None:
                 topic=TRADES_TOPIC,
                 key=out["symbol"].encode(),
                 value=json.dumps(out).encode(),
-                callback=delivery_report if verbose_delivery else None,
+                callback=delivery_cb,
             )
         except Exception as exc:  # noqa: BLE001 — stream must stay up
             print(f"[skip] {exc} | payload snippet={str(raw_payload)[:120]}", file=sys.stderr)
@@ -256,9 +282,9 @@ def main() -> None:
         help="With --dry-run, stop after this many trades (default: 20)",
     )
     parser.add_argument(
-        "--quiet-delivery",
+        "--verbose-delivery",
         action="store_true",
-        help="Kafka mode: do not log per-message delivery callbacks",
+        help="Kafka mode: log every message delivery to stdout (default: summary every 1000)",
     )
     args = parser.parse_args()
 
@@ -270,9 +296,13 @@ def main() -> None:
         run_dry_run(max(1, args.max_events))
         return
 
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [generator] %(levelname)s %(message)s",
+    )
     producer = Producer({"bootstrap.servers": BOOTSTRAP_SERVERS})
     try:
-        run_kafka_loop(producer, verbose_delivery=not args.quiet_delivery)
+        run_kafka_loop(producer, verbose_delivery=args.verbose_delivery)
     finally:
         remaining = producer.flush(timeout=10)
         if remaining:

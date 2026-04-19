@@ -147,6 +147,13 @@ services:
       flink-jobmanager:
         condition: service_healthy
     environment:
+      # TaskManager memory regions (explicit; previously implicit Flink defaults ~1024 MB process):
+      # - process.size: total Flink TaskManager process budget (JVM + frameworks + off-heap).
+      # - task.heap: JVM heap for user tasks and in-heap state; HashMapStateBackend keeps state here.
+      # - managed: off-heap for RocksDB state and heavy sorting; kept small because this deployment
+      #   uses the hashmap state backend (no RocksDB) — managed memory is unused for state but
+      #   still reserved for operators that allocate managed segments (e.g. some sorts).
+      # - network.min/max: shuffle/network buffer pools; fixed equal bounds for stable sizing.
       FLINK_PROPERTIES: |
         jobmanager.rpc.address: flink-jobmanager
         taskmanager.numberOfTaskSlots: 4
@@ -155,6 +162,11 @@ services:
         state.checkpoints.dir: file:///tmp/flink-checkpoints
         execution.checkpointing.interval: 30s
         execution.checkpointing.mode: EXACTLY_ONCE
+        taskmanager.memory.process.size: 1024m
+        taskmanager.memory.task.heap.size: 384m
+        taskmanager.memory.managed.size: 128m
+        taskmanager.memory.network.min: 64m
+        taskmanager.memory.network.max: 64m
     volumes:
       - flink_checkpoints:/tmp/flink-checkpoints
 
