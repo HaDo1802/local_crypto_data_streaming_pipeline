@@ -110,8 +110,9 @@ def main() -> None:
         "bootstrap.servers": BOOTSTRAP_SERVERS,
         "group.id": "lake-writer",
         "auto.offset.reset": "earliest",
-        "enable.auto.commit": True,
-        "auto.commit.interval.ms": 5000 # commit every 5s by default of Confluent lib
+        # Commit offsets only after MinIO uploads succeed so a crash replays the
+        # last uncommitted batch. This is at-least-once, not exactly-once.
+        "enable.auto.commit": False,
     })
     consumer.subscribe([TRADES_TOPIC])
     log.info("Lake writer started | topic=%s  flush=%ss / %s rows",
@@ -147,11 +148,29 @@ def main() -> None:
 
             if (size_flush or time_flush) and buffers:
                 dt = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
-                for symbol, rows in buffers.items():
-                    if rows:
-                        uploader.upload_parquet(rows, symbol, dt)
-                        total_written += len(rows)
+                flush_written = 0
+                flush_failed = False
 
+                for symbol, rows in buffers.items():
+                    if not rows:
+                        continue
+
+                    try:
+                        uploader.upload_parquet(rows, symbol, dt)
+                        flush_written += len(rows)
+                    except Exception as exc:  # noqa: BLE001 - keep consumer alive and retry
+                        log.error("Upload failed for symbol=%s rows=%d: %s", symbol, len(rows), exc)
+                        flush_failed = True
+                        break
+
+                if flush_failed:
+                    # Keep the buffered records and skip the offset commit so the
+                    # next flush retries the same data after a transient failure.
+                    last_flush = time.time()
+                    continue
+
+                consumer.commit()
+                total_written += flush_written
                 buffers = defaultdict(list)
                 last_flush = time.time()
                 log.info("Flush complete. Total rows written: %d", total_written)
