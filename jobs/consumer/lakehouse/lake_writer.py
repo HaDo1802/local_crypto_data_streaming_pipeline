@@ -111,6 +111,7 @@ def main() -> None:
         "group.id": "lake-writer",
         "auto.offset.reset": "earliest",
         "enable.auto.commit": True,
+        "auto.commit.interval.ms": 5000 # commit every 5s by default of Confluent lib
     })
     consumer.subscribe([TRADES_TOPIC])
     log.info("Lake writer started | topic=%s  flush=%ss / %s rows",

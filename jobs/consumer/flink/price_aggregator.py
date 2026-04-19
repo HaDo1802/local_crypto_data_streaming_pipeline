@@ -164,14 +164,16 @@ def register_views(table_env: TableEnvironment) -> None:
         "ohlcv_view",
         table_env.sql_query(
             f"""
+            -- Use MIN_BY/MAX_BY on event-time `ts` so open/close are stable even
+            -- when arrival order differs from the true event order under load.
             SELECT
                 UPPER(symbol) AS symbol,
                 CAST(window_start AS TIMESTAMP(3)) AS window_start,
                 CAST(window_end AS TIMESTAMP(3)) AS window_end,
-                FIRST_VALUE(price) AS open_price,
+                MIN_BY(price, ts) AS open_price,
                 MAX(price) AS high_price,
                 MIN(price) AS low_price,
-                LAST_VALUE(price) AS close_price,
+                MAX_BY(price, ts) AS close_price,
                 ROUND(SUM(quantity), 6) AS volume,
                 COUNT(*) AS trade_count
             FROM TABLE(
