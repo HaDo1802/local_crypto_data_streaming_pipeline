@@ -1,10 +1,5 @@
 """
-price_aggregator.py — Kafka trades -> Flink SQL -> Postgres raw_trades + ohlcv.
-
-Simplified learning version:
-  - Keep all SQL contracts in one file (easy to scan)
-  - Keep only one optional flag (console sink)
-  - Remove helper indirection that is nice in larger production codebases
+price_aggregator.py — Kafka trades -> Flink SQL -> Postgres raw_trades + ohlcv
 """
 
 import os

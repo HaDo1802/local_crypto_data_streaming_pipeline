@@ -41,6 +41,8 @@ def make_on_message(producer: Producer):
                 return                      # skip non-trade events (e.g. ping)
 
             out = map_binance_trade(data)
+
+            # Kafka producer is generated here!
             producer.produce(
                 topic=TRADES_TOPIC,
                 key=out["symbol"].encode(), # key routes same symbol to same partition always

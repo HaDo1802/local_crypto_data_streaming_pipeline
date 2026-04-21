@@ -1,9 +1,5 @@
 """
 lake_writer.py — Kafka trades -> batched Parquet files in MinIO.
-
-Simplified learning version:
-  - Keep one loop with two flush triggers (time + batch size)
-  - Keep at-least-once behavior by committing offsets only after successful upload
 """
 
 import io
