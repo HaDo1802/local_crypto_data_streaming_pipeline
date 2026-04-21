@@ -1,29 +1,17 @@
 """
-lake_writer.py — consumes trade events from Kafka, batches them in memory,
-and writes columnar Parquet files to MinIO (S3-compatible lakehouse).
+lake_writer.py — Kafka trades -> batched Parquet files in MinIO.
 
-Storage layout:
-  lakehouse/trades/dt=YYYY-MM-DD/symbol=<SYM>/part-<n>.parquet
-
-This gives a Hive-style partition layout that tools like DuckDB, Trino,
-or Spark can query directly using partition pruning.
-
-Design decisions:
-  - Confluent kafka consumer (same lib as generator — single dependency)
-  - pyarrow for in-process Parquet serialisation (no Spark overhead)
-  - boto3 for S3-API uploads to MinIO
-  - Two flush triggers: time-based (FLUSH_INTERVAL_SEC) and size-based
-    (FLUSH_BATCH_SIZE), whichever fires first
+Simplified learning version:
+  - Keep one loop with two flush triggers (time + batch size)
+  - Keep at-least-once behavior by committing offsets only after successful upload
 """
 
 import io
 import json
-import logging
 import os
 import time
 from collections import defaultdict
 from datetime import datetime, timezone
-from typing import Dict, List
 
 import boto3
 import pyarrow as pa
@@ -41,14 +29,6 @@ MINIO_BUCKET = os.getenv("MINIO_BUCKET", "lakehouse")
 FLUSH_INTERVAL_SEC = int(os.getenv("FLUSH_INTERVAL_SEC", "60"))
 FLUSH_BATCH_SIZE = int(os.getenv("FLUSH_BATCH_SIZE", "500"))
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [lake-writer] %(levelname)s %(message)s",
-    datefmt="%H:%M:%S",
-)
-log = logging.getLogger(__name__)
-
-# ── Pyarrow schema matching trade events ────────────────────────────────────
 TRADE_PA_SCHEMA = pa.schema([
     pa.field("trade_id",   pa.string()),
     pa.field("symbol",     pa.string()),
@@ -56,71 +36,43 @@ TRADE_PA_SCHEMA = pa.schema([
     pa.field("quantity",   pa.float64()),
     pa.field("side",       pa.string()),
     pa.field("event_time", pa.int64()),
-    pa.field("written_at", pa.int64()),   # epoch ms — set by lake writer
+    pa.field("written_at", pa.int64()),
 ])
 
 
-class MinIOUploader:
-    def __init__(self) -> None:
-        self.client = boto3.client(
-            "s3",
-            endpoint_url=MINIO_ENDPOINT,
-            aws_access_key_id=MINIO_ACCESS_KEY,
-            aws_secret_access_key=MINIO_SECRET_KEY,
-            config=Config(signature_version="s3v4"),
-            region_name="us-east-1",
-        )
-        self.part_counter: Dict[str, int] = defaultdict(int)
+def get_minio_client():
+    return boto3.client(
+        "s3",
+        endpoint_url=MINIO_ENDPOINT,
+        aws_access_key_id=MINIO_ACCESS_KEY,
+        aws_secret_access_key=MINIO_SECRET_KEY,
+        config=Config(signature_version="s3v4"),
+        region_name="us-east-1",
+    )
 
-    def upload_parquet(self, records: List[dict], symbol: str, dt: str) -> str:
-        """Serialise records to Parquet and upload to MinIO. Returns the S3 key."""
-        # Convert list-of-dicts → columnar Arrow table
-        arrays = {field.name: [] for field in TRADE_PA_SCHEMA}
-        now_ms = int(time.time() * 1000)
-        for rec in records:
-            for col_name in ["trade_id", "symbol", "price", "quantity", "side", "event_time"]:
-                arrays[col_name].append(rec.get(col_name))
-            arrays["written_at"].append(now_ms)
 
-        table = pa.table(
-            {k: pa.array(v) for k, v in arrays.items()},
-            schema=TRADE_PA_SCHEMA,
-        )
+def upload_parquet(client, records: list[dict], symbol: str, dt: str, part_n: int) -> str:
+    arrays = {field.name: [] for field in TRADE_PA_SCHEMA}
+    now_ms = int(time.time() * 1000)
+    for rec in records:
+        arrays["trade_id"].append(rec.get("trade_id"))
+        arrays["symbol"].append(rec.get("symbol"))
+        arrays["price"].append(rec.get("price"))
+        arrays["quantity"].append(rec.get("quantity"))
+        arrays["side"].append(rec.get("side"))
+        arrays["event_time"].append(rec.get("event_time"))
+        arrays["written_at"].append(now_ms)
 
-        # Write to an in-memory buffer — no temp files needed
-        buf = io.BytesIO()
-        pq.write_table(table, buf, compression="snappy")
-        size_kb = buf.tell() / 1024
-        buf.seek(0)
+    table = pa.table({k: pa.array(v) for k, v in arrays.items()}, schema=TRADE_PA_SCHEMA)
+    buf = io.BytesIO()
+    pq.write_table(table, buf, compression="snappy")
+    size_kb = buf.tell() / 1024
+    buf.seek(0)
 
-        self.part_counter[(dt, symbol)] += 1
-        part_n = self.part_counter[(dt, symbol)]
-        key = f"trades/dt={dt}/symbol={symbol}/part-{part_n:05d}.parquet"
-
-        # Retry a few times because object storage failures are often transient,
-        # and we want the flush loop to fail only after bounded recovery attempts.
-        for attempt, backoff_seconds in enumerate((2, 4, 8), start=1):
-            try:
-                buf.seek(0)
-                self.client.upload_fileobj(buf, MINIO_BUCKET, key)
-                break
-            except Exception:
-                if attempt == 3:
-                    raise
-                log.warning(
-                    "Upload retry %d/3 failed for s3://%s/%s; sleeping %ss",
-                    attempt,
-                    MINIO_BUCKET,
-                    key,
-                    backoff_seconds,
-                )
-                time.sleep(backoff_seconds)
-
-        log.info(
-            "Uploaded  s3://%s/%s  (%d rows, %.1f KB)",
-            MINIO_BUCKET, key, len(records), size_kb,
-        )
-        return key
+    key = f"trades/dt={dt}/symbol={symbol}/part-{part_n:05d}.parquet"
+    client.upload_fileobj(buf, MINIO_BUCKET, key)
+    print(f"[uploaded] s3://{MINIO_BUCKET}/{key} ({len(records)} rows, {size_kb:.1f} KB)")
+    return key
 
 
 def main() -> None:
@@ -128,18 +80,14 @@ def main() -> None:
         "bootstrap.servers": BOOTSTRAP_SERVERS,
         "group.id": "lake-writer",
         "auto.offset.reset": "earliest",
-        # Commit offsets only after MinIO uploads succeed so a crash replays the
-        # last uncommitted batch. This is at-least-once, not exactly-once.
         "enable.auto.commit": False,
     })
     consumer.subscribe([TRADES_TOPIC])
-    log.info("Lake writer started | topic=%s  flush=%ss / %s rows",
-             TRADES_TOPIC, FLUSH_INTERVAL_SEC, FLUSH_BATCH_SIZE)
+    print(f"Lake writer started | topic={TRADES_TOPIC} flush={FLUSH_INTERVAL_SEC}s/{FLUSH_BATCH_SIZE} rows")
 
-    uploader = MinIOUploader()
-
-    # Buffer: symbol → list of trade dicts for current flush window
-    buffers: Dict[str, List[dict]] = defaultdict(list)
+    minio = get_minio_client()
+    buffers: dict[str, list[dict]] = defaultdict(list)
+    part_counter: dict[tuple[str, str], int] = defaultdict(int)
     last_flush = time.time()
     total_written = 0
 
@@ -148,19 +96,18 @@ def main() -> None:
             msg = consumer.poll(timeout=1.0)
 
             if msg is None:
-                pass  # no new messages — check flush timer below
+                pass
             elif msg.error():
                 if msg.error().code() != KafkaError._PARTITION_EOF:
-                    log.error("Kafka error: %s", msg.error())
+                    print(f"[kafka-error] {msg.error()}")
             else:
                 try:
                     trade = json.loads(msg.value().decode("utf-8"))
                     symbol = trade.get("symbol", "UNKNOWN")
                     buffers[symbol].append(trade)
-                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-                    log.warning("Skipping malformed message: %s", exc)
+                except Exception as exc:
+                    print(f"[skip] malformed message: {exc}")
 
-            # Determine if any buffer has hit the size threshold
             size_flush = any(len(rows) >= FLUSH_BATCH_SIZE for rows in buffers.values())
             time_flush = (time.time() - last_flush) >= FLUSH_INTERVAL_SEC
 
@@ -174,16 +121,15 @@ def main() -> None:
                         continue
 
                     try:
-                        uploader.upload_parquet(rows, symbol, dt)
+                        part_counter[(dt, symbol)] += 1
+                        upload_parquet(minio, rows, symbol, dt, part_counter[(dt, symbol)])
                         flush_written += len(rows)
-                    except Exception as exc:  # noqa: BLE001 - keep consumer alive and retry
-                        log.error("Upload failed for symbol=%s rows=%d: %s", symbol, len(rows), exc)
+                    except Exception as exc:
+                        print(f"[upload-failed] symbol={symbol} rows={len(rows)} error={exc}")
                         flush_failed = True
                         break
 
                 if flush_failed:
-                    # Keep the buffered records and skip the offset commit so the
-                    # next flush retries the same data after a transient failure.
                     last_flush = time.time()
                     continue
 
@@ -191,10 +137,10 @@ def main() -> None:
                 total_written += flush_written
                 buffers = defaultdict(list)
                 last_flush = time.time()
-                log.info("Flush complete. Total rows written: %d", total_written)
+                print(f"[flush] wrote={flush_written} total={total_written}")
 
     except KeyboardInterrupt:
-        log.info("Lake writer stopped.")
+        print("Lake writer stopped.")
     finally:
         consumer.close()
 

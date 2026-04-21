@@ -13,3 +13,4 @@ __pycache__/
 *.log
 .DS_Store
 docs/
+learning.md
