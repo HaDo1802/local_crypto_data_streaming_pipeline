@@ -1,5 +1,6 @@
 name: local_streaming_project_finance
 
+
 x-kafka-bootstrap: &kafka-bootstrap kafka:9092
 x-flink-image: &flink-image local_streaming_project_finance-flink:latest
 
@@ -7,9 +8,11 @@ services:
   kafka:
     image: apache/kafka:4.0.0
     hostname: kafka
+    mem_limit: 896m # 512m heap + room for broker overhead and some page cache
     ports:
       - "19092:19092"
     environment:
+      KAFKA_HEAP_OPTS: "-Xms512m -Xmx512m" # Reduced heap so the broker still has memory left for page cache inside a ~1g envelope
       KAFKA_KRAFT_MODE: "true"
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
@@ -20,7 +23,7 @@ services:
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
-      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_NUM_PARTITIONS: ${PARALLELISM} # Convention: keep the broker default aligned with Flink parallelism for local topics
       KAFKA_DEFAULT_REPLICATION_FACTOR: 1
       KAFKA_MIN_INSYNC_REPLICAS: 1
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
@@ -46,7 +49,7 @@ services:
     command:
       - >
         /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092
-        --create --if-not-exists --topic trades --partitions 3 --replication-factor 1 &&
+        --create --if-not-exists --topic trades --partitions ${PARALLELISM} --replication-factor 1 &&
         /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --list &&
         echo "Kafka topics ready."
 
@@ -63,6 +66,7 @@ services:
 
   postgres:
     image: postgres:16
+    mem_limit: 512m # Enough for a small local serving DB without crowding Flink/Kafka
     ports:
       - "5433:5432"
     environment:
@@ -80,6 +84,7 @@ services:
 
   minio:
     image: minio/minio:latest
+    mem_limit: 256m # Small local object store budget; this pipeline is not MinIO-heavy
     ports:
       - "9000:9000"
       - "9001:9001"
@@ -114,14 +119,15 @@ services:
       context: .
       dockerfile: docker/Dockerfile.flink
     hostname: flink-jobmanager
+    mem_limit: 512m # Control-plane only; keep it bounded well below the TaskManager
     command: jobmanager
     ports:
       - "8082:8081"
     environment:
       FLINK_PROPERTIES: |
         jobmanager.rpc.address: flink-jobmanager
-        taskmanager.numberOfTaskSlots: 4
-        parallelism.default: 3
+        jobmanager.memory.process.size: 384m
+        parallelism.default: ${PARALLELISM}
         state.backend: hashmap
         state.checkpoints.dir: file:///tmp/flink-checkpoints
         execution.checkpointing.interval: 30s
@@ -136,37 +142,34 @@ services:
       retries: 12
       start_period: 30s
 
+  # TaskManager memory is split between Flink-accounted regions and JVM regions.
+  # `taskmanager.memory.process.size` is the total process budget; it is larger
+  # than the explicit Flink regions below because JVM metaspace and JVM overhead
+  # live outside Flink's managed memory accounting.
   flink-taskmanager:
     image: *flink-image
     build:
       context: .
       dockerfile: docker/Dockerfile.flink
     hostname: flink-taskmanager
+    mem_limit: 1280m # Largest budget in the stack; this is where state and operator work live
     command: taskmanager
     depends_on:
       flink-jobmanager:
         condition: service_healthy
     environment:
-      # TaskManager memory regions (explicit; previously implicit Flink defaults ~1024 MB process):
-      # - process.size: total Flink TaskManager process budget (JVM + frameworks + off-heap).
-      # - task.heap: JVM heap for user tasks and in-heap state; HashMapStateBackend keeps state here.
-      # - managed: off-heap for RocksDB state and heavy sorting; kept small because this deployment
-      #   uses the hashmap state backend (no RocksDB) — managed memory is unused for state but
-      #   still reserved for operators that allocate managed segments (e.g. some sorts).
-      # - network.min/max: shuffle/network buffer pools; fixed equal bounds for stable sizing.
       FLINK_PROPERTIES: |
-        jobmanager.rpc.address: flink-jobmanager
-        taskmanager.numberOfTaskSlots: 4
-        parallelism.default: 3
+        taskmanager.numberOfTaskSlots: ${PARALLELISM} # Convention: align slots with job parallelism for this single-TaskManager local setup
+        parallelism.default: ${PARALLELISM}
         state.backend: hashmap
         state.checkpoints.dir: file:///tmp/flink-checkpoints
         execution.checkpointing.interval: 30s
         execution.checkpointing.mode: EXACTLY_ONCE
-        taskmanager.memory.process.size: 1024m
-        taskmanager.memory.task.heap.size: 384m
-        taskmanager.memory.managed.size: 128m
-        taskmanager.memory.network.min: 64m
-        taskmanager.memory.network.max: 64m
+        taskmanager.memory.process.size: 1g
+        taskmanager.memory.task.heap.size: 512m
+        taskmanager.memory.managed.size: 160m
+        taskmanager.memory.network.min: 96m
+        taskmanager.memory.network.max: 96m
     volumes:
       - flink_checkpoints:/tmp/flink-checkpoints
 
@@ -175,7 +178,9 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile.flink
-    restart: on-failure
+    mem_limit: 128m # One-shot submitter; only needs enough memory to launch the Flink job
+    # One-shot job submitter: it should not auto-restart and resubmit duplicate jobs.
+    restart: "no"
     depends_on:
       flink-jobmanager:
         condition: service_healthy
@@ -198,12 +203,13 @@ services:
         /opt/flink/bin/flink run
         --jobmanager flink-jobmanager:8081
         --python /opt/flink/jobs/price_aggregator.py
-        -D parallelism.default=3
+        -D parallelism.default=${PARALLELISM}
 
   generator:
     build:
       context: .
       dockerfile: docker/Dockerfile.generator
+    mem_limit: 128m # Lightweight producer; keep small so Kafka/Flink keep the headroom
     restart: on-failure
     environment:
       BOOTSTRAP_SERVERS: *kafka-bootstrap
@@ -218,6 +224,7 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile.lake
+    mem_limit: 192m # Small consumer/writer budget for local archiving
     restart: on-failure
     depends_on:
       kafka-init-topics:
@@ -238,6 +245,7 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile.api
+    mem_limit: 192m # Small local API budget; protects the host from accidental leaks
     ports:
       - "8000:8000"
     environment:

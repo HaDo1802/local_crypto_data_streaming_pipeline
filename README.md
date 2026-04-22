@@ -16,11 +16,10 @@ cp .env.example .env
 
 2. Start the full platform.
 
-COMPOSE_BAKE helps optimize the spin up for containers in complex setup
-
 ```bash
 COMPOSE_BAKE=true docker compose up -d --build
 ```
+**Note:** The `COMPOSE_BAKE` command is designed to streamline the startup process for containers in complex setups. It optimizes the spin up of containers by ensuring that all necessary containers are started efficiently and in the correct order. This helps to improve the overall performance and reliability of the system.
 
 3. Open the UIs.
 
@@ -28,6 +27,21 @@ COMPOSE_BAKE=true docker compose up -d --build
 - Kafka UI: `http://localhost:8080`
 - Flink UI: `http://localhost:8082`
 - MinIO Console: `http://localhost:9001`
+
+## Local Resource Profile
+
+This stack is currently tuned for a constrained local Docker budget of roughly `4 GB` total memory.
+
+- Kafka: `mem_limit: 896m`, JVM heap `512m`
+- Flink JobManager: `mem_limit: 512m`, `jobmanager.memory.process.size: 384m`
+- Flink TaskManager: `mem_limit: 1280m`, `taskmanager.memory.process.size: 1g`
+- Postgres: `mem_limit: 512m`
+- MinIO: `mem_limit: 256m`
+- API: `mem_limit: 192m`
+- Generator: `mem_limit: 128m`
+- Lake Writer: `mem_limit: 192m`
+
+The goal is local stability rather than peak throughput: keep every service bounded, leave Kafka some room for page cache, and keep Flink's internal memory settings below the container ceiling.
 
 ## Expected Output
 
@@ -72,3 +86,9 @@ You should see these services up:
 ### MinIO
 
 ![MinIO](image/minio.png)
+
+## References Docs
+
+- [Running ](https://github.com/binance-exchange/binance-official-api-docs)
+- [Kafka UI](https://github.com/provectus/kafka-ui)
+- [Flink UI](https://github.com/apache/flink/tree/main/flink-ui)
