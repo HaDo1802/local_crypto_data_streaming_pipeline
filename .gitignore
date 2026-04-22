@@ -12,5 +12,4 @@ __pycache__/
 .vscode/
 *.log
 .DS_Store
-docs/
-learning.md
+architecture.md
