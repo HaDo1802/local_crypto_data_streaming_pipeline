@@ -40,7 +40,7 @@ This stack is currently tuned for a constrained local Docker budget of roughly `
 - API: `mem_limit: 192m`
 - Generator: `mem_limit: 128m`
 - Lake Writer: `mem_limit: 192m`
-
+![docker_infra](image/docker_infra.png)
 The goal is local stability rather than peak throughput: keep every service bounded, leave Kafka some room for page cache, and keep Flink's internal memory settings below the container ceiling.
 
 ## Expected Output
@@ -89,6 +89,4 @@ You should see these services up:
 
 ## References Docs
 
-- [Running ](https://github.com/binance-exchange/binance-official-api-docs)
-- [Kafka UI](https://github.com/provectus/kafka-ui)
-- [Flink UI](https://github.com/apache/flink/tree/main/flink-ui)
+- [Architecture ](docs/architecture.md)
